@@ -1,11 +1,20 @@
 import telebot
 import os
 import random
+import logging
+import sqlite3
+import csv
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 API_TOKEN = os.getenv('TELEGRAM_TOKEN') or '7601370339:AAH_tTzX6GUwkExnxIAUJ5144DZCzUCAGQE'
 bot = telebot.TeleBot(API_TOKEN)
 
-print('Бот запущен!')
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    handlers=[logging.FileHandler('bot.log', encoding='utf-8'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 users = {}
 tasks = [
@@ -35,35 +44,113 @@ prizes = [
     {'name': 'Толстовка с любым принтом', 'cost': 1300},
     {'name': 'Подарочная карта (в процессе запуска)', 'cost': 0},
 ]
-admin_id = None  # сюда можно вписать свой user_id для поддержки
+admin_id = 790005263 # сюда можно вписать свой user_id для поддержки
 support_messages = []
 
-# --- Вспомогательные функции ---
+# --- Глобальное состояние для админ-режима (in-memory, на сессию) ---
+admin_states = {}
+
+# --- Инициализация БД ---
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        full_name TEXT,
+        age INTEGER,
+        city TEXT,
+        balance INTEGER DEFAULT 0,
+        ref_code TEXT,
+        invited_by TEXT,
+        tasks_done TEXT,
+        ref_friends TEXT,
+        ref_progress TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- Вспомогательные функции для работы с БД ---
 def get_user(user_id):
-    if user_id not in users:
-        users[user_id] = {
-            'balance': 0,
-            'full_name': '',
-            'age': '',
-            'city': '',
-            'tasks_done': set(),
-            'ref_code': str(user_id),
-            'invited_by': None,
-            'ref_friends': set(),
-            'ref_progress': {},  # user_id: tasks_done_count
-        }
-    return users[user_id]
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE user_id=?', (user_id,))
+    row = c.fetchone()
+    if not row:
+        # Новый пользователь
+        c.execute('''INSERT INTO users (user_id, balance, ref_code, tasks_done, ref_friends, ref_progress)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (user_id, 0, str(user_id), '', '', ''))
+        conn.commit()
+        c.execute('SELECT * FROM users WHERE user_id=?', (user_id,))
+        row = c.fetchone()
+    user = {
+        'user_id': row[0],
+        'full_name': row[1] or '',
+        'age': row[2] or '',
+        'city': row[3] or '',
+        'balance': row[4],
+        'ref_code': row[5],
+        'invited_by': row[6],
+        'tasks_done': set(map(int, row[7].split(','))) if row[7] else set(),
+        'ref_friends': set(map(int, row[8].split(','))) if row[8] else set(),
+        'ref_progress': eval(row[9]) if row[9] else {},
+    }
+    conn.close()
+    return user
+
+def save_user(user):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''UPDATE users SET full_name=?, age=?, city=?, balance=?, ref_code=?, invited_by=?,
+                 tasks_done=?, ref_friends=?, ref_progress=? WHERE user_id=?''',
+              (user['full_name'], user['age'], user['city'], user['balance'], user['ref_code'], user['invited_by'],
+               ','.join(map(str, user['tasks_done'])), ','.join(map(str, user['ref_friends'])), str(user['ref_progress']), user['user_id']))
+    conn.commit()
+    conn.close()
 
 def show_menu(user_id):
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("Расскажи про игру подробнее")
-    markup.add("Правила игры и обмена дублей на подарки")
-    markup.add("Список заданий")
-    markup.add("Реферальная программа")
-    markup.add("Мой баланс дублей")
-    markup.add("Обменять дубли на призы")
-    markup.add("Служба поддержки")
-    bot.send_message(user_id, "Главное меню:", reply_markup=markup)
+    # Если админ и не в режиме админ-панели — добавить кнопку
+    if user_id == admin_id and not admin_states.get(user_id, False):
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📋 Список заданий", callback_data="menu_tasks"),
+            InlineKeyboardButton("🎁 Обменять дубли на призы", callback_data="menu_prizes"),
+            InlineKeyboardButton("💰 Мой баланс дублей", callback_data="menu_balance"),
+            InlineKeyboardButton("👥 Реферальная программа", callback_data="menu_ref"),
+            InlineKeyboardButton("ℹ️ Про игру", callback_data="menu_about"),
+            InlineKeyboardButton("📜 Правила", callback_data="menu_rules"),
+            InlineKeyboardButton("🆘 Служба поддержки", callback_data="menu_support"),
+            InlineKeyboardButton("👑 Админ-панель", callback_data="menu_admin")
+        )
+        bot.send_message(user_id, "\u2B50 Главное меню:", reply_markup=markup)
+        return
+    # Если админ и в режиме админ-панели
+    if user_id == admin_id and admin_states.get(user_id, False):
+        show_admin_menu(user_id)
+        return
+    # Обычный пользователь
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📋 Список заданий", callback_data="menu_tasks"),
+        InlineKeyboardButton("🎁 Обменять дубли на призы", callback_data="menu_prizes"),
+        InlineKeyboardButton("💰 Мой баланс дублей", callback_data="menu_balance"),
+        InlineKeyboardButton("👥 Реферальная программа", callback_data="menu_ref"),
+        InlineKeyboardButton("ℹ️ Про игру", callback_data="menu_about"),
+        InlineKeyboardButton("📜 Правила", callback_data="menu_rules"),
+        InlineKeyboardButton("🆘 Служба поддержки", callback_data="menu_support")
+    )
+    bot.send_message(user_id, "\u2B50 Главное меню:", reply_markup=markup)
+
+def show_admin_menu(user_id):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        "📊 Статистика", "👤 Пользователи",
+        "📥 Выгрузка", "📨 Обращения",
+        "⬅️ В меню игрока"
+    )
+    bot.send_message(user_id, "<b>👑 Админ-панель:</b>", reply_markup=markup, parse_mode='HTML')
 
 # --- Регистрация ---
 @bot.message_handler(commands=['start'])
@@ -71,17 +158,25 @@ def send_welcome(message):
     user_id = message.from_user.id
     user = get_user(user_id)
     if user['full_name']:
-        bot.send_message(user_id, "Ты уже зарегистрирован!")
+        bot.send_message(user_id, "\u2705 Ты уже зарегистрирован!", parse_mode='HTML')
         show_menu(user_id)
         return
     user['balance'] += 10
-    bot.send_message(user_id, "👋 Привет! Я Тренер — твой проводник в игре!\n\nДобро пожаловать в увлекательное путешествие, в котором, выполняя задания, ты сможешь заработать Дубли, которые сможешь обменять на реальные призы!\n\nТебе начислено 10 дублей за старт.\n\nКак тебя зовут? (ФИ)")
+    save_user(user)
+    bot.send_message(
+        user_id,
+        "<b>👋 Привет! Я — Тренер, твой проводник в игре!</b>\n\n"
+        "Добро пожаловать в увлекательное путешествие, где, выполняя задания, ты сможешь заработать <b>Дубли</b> и обменять их на реальные призы!\n\n"
+        "<b>+10 дублей</b> за старт!\n\nКак тебя зовут? (ФИ)",
+        parse_mode='HTML'
+    )
     bot.register_next_step_handler(message, reg_full_name)
 
 def reg_full_name(message):
     user_id = message.from_user.id
     user = get_user(user_id)
     user['full_name'] = message.text
+    save_user(user)
     bot.send_message(user_id, "Сколько тебе лет?")
     bot.register_next_step_handler(message, reg_age)
 
@@ -93,6 +188,7 @@ def reg_age(message):
         bot.register_next_step_handler(message, reg_age)
         return
     user['age'] = int(message.text)
+    save_user(user)
     bot.send_message(user_id, "Из какого ты города? (по прописке)")
     bot.register_next_step_handler(message, reg_city)
 
@@ -101,42 +197,55 @@ def reg_city(message):
     user = get_user(user_id)
     user['city'] = message.text
     user['balance'] += 25
-    bot.send_message(user_id, "Поздравляем, игрок зарегистрирован! Поехали.\n\nТебе начислено 25 дублей.")
+    save_user(user)
+    bot.send_message(
+        user_id,
+        "<b>Поздравляем, игрок зарегистрирован!</b>\n\n+25 дублей за регистрацию.\n\nПоехали!",
+        parse_mode='HTML'
+    )
     show_menu(user_id)
 
 # --- Меню ---
-@bot.message_handler(func=lambda m: m.text == "Мой баланс дублей")
+@bot.message_handler(func=lambda m: m.text == "💰 Мой баланс дублей")
 def show_balance(message):
     user_id = message.from_user.id
     user = get_user(user_id)
-    bot.send_message(user_id, f"В твоем рюкзаке лежит {user['balance']} дублей")
+    bot.send_message(
+        user_id,
+        f"<b>В твоем рюкзаке:</b> <code>{user['balance']}</code> дублей \U0001F4B0",
+        parse_mode='HTML'
+    )
 
-@bot.message_handler(func=lambda m: m.text == "Расскажи про игру подробнее")
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Про игру")
 def about_game(message):
     text = (
-        "Суть игры в выполнении заданий в течении 3 месяцев, за которые ты получаешь дубли. Дубли можно обменять на реальные призы.\n"
-        "Задания есть 2 типов:\n- ежедневные\n- еженедельные\n"
-        "За каждое выполненное задание ты получаешь дубли. Так же ты получишь дубли, если приведешь в игру друзей.\n"
-        "Так же ты будешь получать дубли за ежедневный вход в игру.\n"
-        "Остались вопросы? Напиши нам в службу поддержки"
+        "<b>О проекте</b>\n\n"
+        "Выполняй задания в течение 3 месяцев, зарабатывай <b>дубли</b> и обменивай их на реальные призы!\n\n"
+        "<b>Типы заданий:</b>\n• Ежедневные\n• Еженедельные\n\n"
+        "<b>За что начисляются дубли:</b>\n"
+        "• Выполнение заданий\n"
+        "• Приведи друга\n"
+        "• Ежедневный вход в игру\n\n"
+        "<i>Остались вопросы? Напиши в службу поддержки!</i>"
     )
-    bot.send_message(message.from_user.id, text)
+    bot.send_message(message.from_user.id, text, parse_mode='HTML')
 
-@bot.message_handler(func=lambda m: m.text == "Правила игры и обмена дублей на подарки")
+@bot.message_handler(func=lambda m: m.text == "📜 Правила")
 def rules(message):
     text = (
-        "Первое правило игры – рассказывать всем об этой игре.\n"
-        "Второе правило – смотри первое правило.\n"
-        "На самом деле, как таковых правил практически нет. НО, игра не терпит оскорблений, мата и любой пошлости, как визуальной так и словесной.\n"
-        "Правило обмена дублей на призы:\n"
-        "- обменять можно в любое время, когда ты накопишь достаточно количество дублей (минимум 400)\n"
-        "- Обменять дубли можно на призы из перечня (смотри во вкладке «обменять дубли на призы»)\n"
-        "- Так же обменять дубли можно на призы с маркетплейсов (Озон или ВБ), прислав ссылку на товар. Количество дублей в вашем рюкзаке должно быть не меньше стоимости товара на маркетплейсе."
+        "<b>Правила игры и обмена дублей на призы</b>\n\n"
+        "1️⃣ <b>Рассказывай всем об этой игре!</b>\n"
+        "2️⃣ <b>Смотри правило №1</b>\n\n"
+        "<b>Запрещено:</b> оскорбления, мат, пошлость (в т.ч. визуальная).\n\n"
+        "<b>Обмен дублей на призы:</b>\n"
+        "• Минимум для обмена — 400 дублей\n"
+        "• Призы — смотри во вкладке <b>Обменять дубли на призы</b>\n"
+        "• Можно обменять дубли на товар с маркетплейса (Озон/ВБ), если дублей не меньше стоимости товара."
     )
-    bot.send_message(message.from_user.id, text)
+    bot.send_message(message.from_user.id, text, parse_mode='HTML')
 
 # --- Задания ---
-@bot.message_handler(func=lambda m: m.text == "Список заданий")
+@bot.message_handler(func=lambda m: m.text == "📋 Список заданий")
 def task_list(message):
     user_id = message.from_user.id
     user = get_user(user_id)
@@ -148,7 +257,7 @@ def task_list(message):
             markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data=f"do_task_{task['id']}"))
         else:
             markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data="done"))
-    bot.send_message(user_id, "Выбери задание для выполнения:", reply_markup=markup)
+    bot.send_message(user_id, "<b>Выбери задание для выполнения:</b>", reply_markup=markup, parse_mode='HTML')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('do_task_'))
 def do_task(call):
@@ -162,7 +271,7 @@ def do_task(call):
     reward = next((t['reward'] for t in tasks if t['id'] == task_id), 0)
     user['balance'] += reward
     bot.answer_callback_query(call.id, f"Задание выполнено! +{reward} дублей")
-    bot.edit_message_text("Задание выполнено! +{0} дублей".format(reward), user_id, call.message.message_id)
+    bot.edit_message_text(f"<b>Задание выполнено!</b> +{reward} дублей", user_id, call.message.message_id, parse_mode='HTML')
     # Реферальный прогресс
     if user['invited_by']:
         inviter = get_user(int(user['invited_by']))
@@ -171,20 +280,21 @@ def do_task(call):
         if inviter['ref_progress'][user_id] == 3:
             inviter['balance'] += 100
             inviter['ref_friends'].add(user_id)
-            bot.send_message(inviter['ref_code'], f"Твой друг {user['full_name']} выполнил 3 задания! Тебе начислено 100 дублей.")
+            bot.send_message(inviter['ref_code'], f"🎉 Твой друг <b>{user['full_name']}</b> выполнил 3 задания! Тебе начислено <b>100 дублей</b>.", parse_mode='HTML')
 
 # --- Рефералы ---
-@bot.message_handler(func=lambda m: m.text == "Реферальная программа")
+@bot.message_handler(func=lambda m: m.text == "👥 Реферальная программа")
 def referral(message):
     user_id = message.from_user.id
     user = get_user(user_id)
     ref_link = f"/start {user['ref_code']}"
     text = (
-        "Приведи друга и получи 100 дублей\n"
-        f"Ссылка для друга – {ref_link}\n"
-        "ВАЖНО!\nТебе будут начислены дубли после того, как твой друг выполнит 3 задания."
+        "<b>Реферальная программа</b>\n\n"
+        "Приведи друга и получи <b>100 дублей</b>!\n"
+        f"<b>Ссылка для друга:</b> <code>{ref_link}</code>\n\n"
+        "<b>ВАЖНО!</b> Дубли начисляются после того, как друг выполнит 3 задания."
     )
-    bot.send_message(user_id, text)
+    bot.send_message(user_id, text, parse_mode='HTML')
 
 @bot.message_handler(commands=['start'])
 def start_with_ref(message):
@@ -198,19 +308,20 @@ def start_with_ref(message):
     send_welcome(message)
 
 # --- Обмен призов ---
-@bot.message_handler(func=lambda m: m.text == "Обменять дубли на призы")
+@bot.message_handler(func=lambda m: m.text == "🎁 Обменять дубли на призы")
 def exchange_prizes(message):
     user_id = message.from_user.id
     user = get_user(user_id)
-    text = f"В твоем рюкзаке лежит {user['balance']} дублей\n"
+    text = f"<b>В твоем рюкзаке:</b> <code>{user['balance']}</code> дублей \U0001F4B0\n\n"
+    text += "<b>Доступные призы:</b>\n"
     for prize in prizes:
         if prize['cost'] > 0:
-            text += f"{prize['name']} – {prize['cost']} дублей\n"
+            text += f"• {prize['name']} — <b>{prize['cost']} дублей</b>\n"
         else:
-            text += f"{prize['name']}\n"
-    text += "\nЧтобы обменять дубли на приз, напиши: ПРИЗ <название>\n"
-    text += "Чтобы обменять дубли на товар с маркетплейса, напиши: МАРКЕТ <ссылка> <стоимость>"
-    bot.send_message(user_id, text)
+            text += f"• {prize['name']}\n"
+    text += "\nЧтобы обменять дубли на приз, напиши: <code>ПРИЗ &lt;название&gt;</code>\n"
+    text += "Чтобы обменять дубли на товар с маркетплейса, напиши: <code>МАРКЕТ &lt;ссылка&gt; &lt;стоимость&gt;</code>"
+    bot.send_message(user_id, text, parse_mode='HTML')
 
 @bot.message_handler(regexp=r'^ПРИЗ (.+)')
 def buy_prize(message):
@@ -219,13 +330,13 @@ def buy_prize(message):
     prize_name = message.text[5:].strip()
     prize = next((p for p in prizes if prize_name.lower() in p['name'].lower()), None)
     if not prize:
-        bot.send_message(user_id, "Такого приза нет.")
+        bot.send_message(user_id, "❌ Такого приза нет.")
         return
     if user['balance'] < prize['cost']:
-        bot.send_message(user_id, "Недостаточно дублей!")
+        bot.send_message(user_id, "❌ Недостаточно дублей!")
         return
     user['balance'] -= prize['cost']
-    bot.send_message(user_id, f"Поздравляем! Ты обменял {prize['cost']} дублей на приз: {prize['name']}")
+    bot.send_message(user_id, f"🎉 Поздравляем! Ты обменял <b>{prize['cost']}</b> дублей на приз: <b>{prize['name']}</b>", parse_mode='HTML')
 
 @bot.message_handler(regexp=r'^МАРКЕТ (.+) (\d+)')
 def buy_market(message):
@@ -239,15 +350,15 @@ def buy_market(message):
         bot.send_message(user_id, "Некорректная стоимость.")
         return
     if user['balance'] < cost:
-        bot.send_message(user_id, "Недостаточно дублей!")
+        bot.send_message(user_id, "❌ Недостаточно дублей!")
         return
     user['balance'] -= cost
-    bot.send_message(user_id, f"Поздравляем! Ты обменял {cost} дублей на товар с маркетплейса: {link}")
+    bot.send_message(user_id, f"🎉 Поздравляем! Ты обменял <b>{cost}</b> дублей на товар с маркетплейса: {link}", parse_mode='HTML')
 
 # --- Поддержка ---
-@bot.message_handler(func=lambda m: m.text == "Служба поддержки")
+@bot.message_handler(func=lambda m: m.text == "🆘 Служба поддержки")
 def support(message):
-    bot.send_message(message.from_user.id, "Напиши свой вопрос, и мы обязательно ответим! Просто отправь сообщение.")
+    bot.send_message(message.from_user.id, "✉️ Напиши свой вопрос, и мы обязательно ответим! Просто отправь сообщение.")
     bot.register_next_step_handler(message, save_support)
 
 def save_support(message):
@@ -257,4 +368,123 @@ def save_support(message):
         bot.send_message(admin_id, f"Вопрос от пользователя {user_id}: {message.text}")
     bot.send_message(user_id, "Спасибо! Ваш вопрос отправлен в поддержку.")
 
-bot.polling(none_stop=True) 
+@bot.message_handler(commands=['export_users'])
+def export_users(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users')
+    rows = c.fetchall()
+    conn.close()
+    filename = 'users_export.csv'
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['user_id', 'full_name', 'age', 'city', 'balance', 'ref_code', 'invited_by', 'tasks_done', 'ref_friends', 'ref_progress'])
+        for row in rows:
+            writer.writerow(row)
+    with open(filename, 'rb') as f:
+        bot.send_document(admin_id, f, caption='Выгрузка пользователей')
+
+# --- Обработка кнопок админ-панели ---
+@bot.message_handler(func=lambda m: m.text == "📥 Выгрузка")
+def admin_export_users(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    export_users(message)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def admin_stats(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM users')
+    total = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM users WHERE balance >= 400')
+    rich = c.fetchone()[0]
+    conn.close()
+    bot.send_message(admin_id, f"Всего пользователей: <b>{total}</b>\n\nС балансом 400+ дублей: <b>{rich}</b>", parse_mode='HTML')
+
+@bot.message_handler(func=lambda m: m.text == "👤 Пользователи")
+def admin_users(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT user_id, full_name, balance FROM users LIMIT 20')
+    rows = c.fetchall()
+    conn.close()
+    text = '<b>Первые 20 пользователей:</b>\n'
+    for row in rows:
+        text += f"ID: <code>{row[0]}</code> | {row[1]} | 💰 {row[2]} дублей\n"
+    bot.send_message(admin_id, text, parse_mode='HTML')
+
+@bot.message_handler(func=lambda m: m.text == "📨 Обращения")
+def admin_support(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    if not support_messages:
+        bot.send_message(admin_id, "Нет новых обращений.")
+        return
+    text = '<b>Последние обращения:</b>\n'
+    for msg in support_messages[-10:]:
+        text += f"ID: <code>{msg['user_id']}</code> — {msg['text']}\n"
+    bot.send_message(admin_id, text, parse_mode='HTML')
+
+# --- Переключение режимов для админа ---
+@bot.message_handler(func=lambda m: m.text == "👑 Админ-панель")
+def to_admin_panel(message):
+    if message.from_user.id != admin_id:
+        return
+    admin_states[admin_id] = True
+    show_admin_menu(admin_id)
+
+@bot.message_handler(func=lambda m: m.text == "⬅️ В меню игрока")
+def to_user_menu(message):
+    if message.from_user.id != admin_id:
+        return
+    admin_states[admin_id] = False
+    show_menu(admin_id)
+
+# --- Обработка инлайн-кнопок главного меню ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('menu_'))
+def handle_main_menu(call):
+    user_id = call.from_user.id
+    data = call.data
+    if data == "menu_tasks":
+        task_list(call)
+    elif data == "menu_prizes":
+        exchange_prizes(call)
+    elif data == "menu_balance":
+        show_balance(call)
+    elif data == "menu_ref":
+        referral(call)
+    elif data == "menu_about":
+        about_game(call)
+    elif data == "menu_rules":
+        rules(call)
+    elif data == "menu_support":
+        support(call)
+    elif data == "menu_admin" and user_id == admin_id:
+        admin_states[admin_id] = True
+        show_admin_menu(admin_id)
+    bot.answer_callback_query(call.id)
+
+# --- Для совместимости: все функции, которые раньше принимали message, теперь должны принимать message или call ---
+def get_message_user_id(message):
+    return message.from_user.id if hasattr(message, 'from_user') else message.message.chat.id
+
+if __name__ == "__main__":
+    logger.info('Бот запущен!')
+    print('Бот запущен!')
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        logger.error(f'Ошибка при запуске бота: {e}')
+        print(f'Ошибка при запуске бота: {e}') 
