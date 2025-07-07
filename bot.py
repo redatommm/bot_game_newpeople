@@ -14,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import time
 from export_to_gsheets import main as export_to_gsheets_main
 
-API_TOKEN = os.getenv('TELEGRAM_TOKEN') or '7675723384:AAH6U5eib6lC82AOlfeHDA55aEPBfENerLg'
+API_TOKEN = os.getenv('TELEGRAM_TOKEN') or ''
 bot = telebot.TeleBot(API_TOKEN)
 
 # --- Указать username своего бота ---

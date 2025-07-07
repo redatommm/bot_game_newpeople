@@ -1,0 +1,37 @@
+[
+  {
+    "id": 33,
+    "name": "Подпишись на канал",
+    "reward": 10,
+    "category": "daily",
+    "desc": "1. Подпишись на канал: \n\n| <a href=\"https://t.me/chukhlebovalex\">Александра Чухлебова</a> в Telegram\n\nЦена: 10 дублей"
+  },
+  {
+    "id": 2,
+    "name": "2 задание",
+    "reward": 30,
+    "category": "daily",
+    "desc": "подпишись"
+  },
+  {
+    "id": 3,
+    "name": "1 задание",
+    "reward": 20,
+    "category": "daily",
+    "desc": "1"
+  },
+  {
+    "id": 34,
+    "name": "подписка на тгк Новых людей",
+    "reward": 10,
+    "category": "daily",
+    "desc": "Подпишись на канал: \n\n|   партии \"Новые люди\" в Telegram\n\nЦена:  10 дублей $"
+  },
+  {
+    "id": 35,
+    "name": "подписка на вк АЧ",
+    "reward": 10,
+    "category": "daily",
+    "desc": "3. Подпишись на канал: \n\n|   <a href=\"https://vk.com/chukhlebovalex\">Александра Чухлебова</a>  в VK\n\nЦена:  10 дублей $"
+  }
+]
