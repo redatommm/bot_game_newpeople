@@ -2,7 +2,6 @@ import telebot
 import os
 import random
 import logging
-import sqlite3
 import csv
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 import threading
@@ -13,9 +12,21 @@ import hashlib
 from apscheduler.schedulers.background import BackgroundScheduler
 import time
 from export_to_gsheets import main as export_to_gsheets_main
+from supabase import create_client, Client
+import calendar
+import requests
 
-API_TOKEN = os.getenv('TELEGRAM_TOKEN') or ''
+API_TOKEN = os.getenv('TELEGRAM_TOKEN') or '7675723384:AAH6U5eib6lC82AOlfeHDA55aEPBfENerLg'
+
+# Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
+
+
+
+# --- Константы для панели модератора ---
+TASKS_PANEL_CHAT_ID = -1002519704761
+TASKS_PANEL_THREAD_ID = 142
+MODERATOR_IDS = [790005263]  # добавь id своих модераторов
 
 # --- Указать username своего бота ---
 BOT_USERNAME = 'Gorod_budushego_bot'  # ЗАМЕНИ на username своего бота без @
@@ -29,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 users = {}
 TASKS_FILE = 'tasks.json'
+
+SUPABASE_URL = "https://qnsfntkhaxtcmlfrlafz.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFuc2ZudGtoYXh0Y21sZnJsYWZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE4ODQxMDksImV4cCI6MjA2NzQ2MDEwOX0.wI-sZUCtEneBKZYLW0sLGZJ9XcZgCQkIfVrKjY7KN5Y"  # замени на свой anon/public key
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Переключатель: откуда брать задания ---
+USE_SUPABASE_TASKS = False  # True — из Supabase, False — из tasks.json
 
 def load_tasks():
     try:
@@ -52,19 +70,19 @@ def load_tasks():
         return []
 
 def get_fresh_tasks():
-    """Загружает свежие задания из файла"""
-    return load_tasks()
-
-def sync_database():
-    """Принудительная синхронизация базы данных"""
-    with sqlite3.connect('users.db') as conn:
-        conn.execute('PRAGMA wal_checkpoint(FULL)')
-        conn.commit()
+    if USE_SUPABASE_TASKS:
+        res = supabase.table("tasks").select("*").execute()
+        return res.data or []
+    else:
+        return load_tasks()
 
 def save_tasks(tasks):
-    # Сохраняем все поля, включая desc
-    with open(TASKS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    if USE_SUPABASE_TASKS:
+        # Можно реализовать сохранение в Supabase, если нужно
+        pass
+    else:
+        with open(TASKS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
 
 tasks = load_tasks()
 
@@ -116,157 +134,62 @@ def block_if_open_task(message):
         return True
     return False
 
-# --- Инициализация БД ---
-def init_db():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            age INTEGER,
-            city TEXT,
-            balance INTEGER DEFAULT 0,
-            ref_code TEXT,
-            invited_by TEXT,
-            ref_friends TEXT,
-            ref_progress TEXT,
-            username TEXT,
-            last_daily TEXT,
-            tasks_done TEXT,
-            weekly_earned INTEGER DEFAULT 0
-        )''')
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN username TEXT')
-        except Exception:
-            pass
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN last_daily TEXT')
-        except Exception:
-            pass
-        # --- Новая таблица для заявок на задания ---
-        c.execute('''CREATE TABLE IF NOT EXISTS pending_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            task_id INTEGER,
-            proof_type TEXT,
-            proof_data TEXT,
-            status TEXT
-        )''')
-        # --- Новая таблица для истории выполнения заданий ---
-        c.execute('''CREATE TABLE IF NOT EXISTS user_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            task_id INTEGER,
-            completed_at TEXT
-        )''')
-        # --- Новая таблица для заявок на призы ---
-        c.execute('''CREATE TABLE IF NOT EXISTS prize_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            prize_name TEXT,
-            prize_cost INTEGER,
-            user_balance INTEGER,
-            additional_info TEXT,
-            status TEXT DEFAULT 'pending',
-            group_message_id INTEGER,
-            created_at TEXT
-        )''')
-        conn.commit()
-
-init_db()
-
 # --- Вспомогательные функции для работы с БД ---
 def get_user(user_id, username=None):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT * FROM users WHERE user_id=?', (user_id,))
-        row = c.fetchone()
-        if not row:
-            # Новый пользователь
-            c.execute('''INSERT INTO users (user_id, balance, ref_code, tasks_done, ref_friends, ref_progress, username, last_daily, weekly_earned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (user_id, 0, str(user_id), '', '', '', username or '', '', 0))
-            conn.commit()
-            c.execute('SELECT * FROM users WHERE user_id=?', (user_id,))
-            row = c.fetchone()
-        # --- Безопасный парсинг tasks_done ---
-        raw_tasks_done = row[7] if len(row) > 7 else ''
-        if not raw_tasks_done or raw_tasks_done in ('{}', 'null', 'None'):
-            tasks_done = set()
-        else:
-            try:
-                tasks_done = set(map(int, raw_tasks_done.split(',')))
-            except Exception as e:
-                logger.error(f"Ошибка парсинга tasks_done: {raw_tasks_done} ({e})")
-                tasks_done = set()
-        # --- Daily streak ---
-        daily_streak = 0
-        if len(row) > 12 and row[12] and str(row[12]).isdigit():
-            daily_streak = int(row[12])
-        weekly_earned = 0
-        if len(row) > 13 and row[13] and str(row[13]).isdigit():
-            weekly_earned = int(row[13])
-        user = {
-            'user_id': row[0],
-            'full_name': row[1] or '',
-            'age': row[2] or '',
-            'city': row[3] or '',
-            'balance': row[4],
-            'ref_code': row[5],
-            'invited_by': row[6],
-            'tasks_done': tasks_done,
-            'ref_friends': set(map(int, row[8].split(','))) if row[8] else set(),
-            'ref_progress': eval(row[9]) if row[9] else {},
-            'username': row[10] if len(row) > 10 else '',
-            'last_daily': row[11] if len(row) > 11 else '',
-            'daily_streak': daily_streak,
-            'weekly_earned': weekly_earned,
-        }
+    res = supabase.table("users").select("*").eq("user_id", user_id).execute()
+    if res.data:
+        user = res.data[0]
+        user['tasks_done'] = set(map(int, user['tasks_done'].split(','))) if user.get('tasks_done') else set()
+        user['ref_friends'] = set(map(int, user['ref_friends'].split(','))) if user.get('ref_friends') else set()
+        try:
+            user['ref_progress'] = json.loads(user['ref_progress']) if user.get('ref_progress') else {}
+        except (json.JSONDecodeError, TypeError):
+            user['ref_progress'] = {}
+        return user
+    # если нет — создать
+    user = {
+        'user_id': user_id,
+        'full_name': '',
+        'age': 0,
+        'city': '',
+        'balance': 0,
+        'ref_code': str(user_id),
+        'invited_by': '',
+        'tasks_done': '',
+        'ref_friends': '',
+        'ref_progress': json.dumps({}),
+        'username': username or '',
+        'last_daily': None,
+        'daily_streak': 0,
+        'weekly_earned': 0,
+        'phone': '',
+    }
+    supabase.table("users").insert(user).execute()
+    user['tasks_done'] = set()
+    user['ref_friends'] = set()
+    user['ref_progress'] = {}
     return user
 
 def save_user(user):
-    with sqlite3.connect('users.db') as conn:
-        # Включаем WAL режим для лучшей производительности
-        conn.execute('PRAGMA journal_mode=WAL')
-        c = conn.cursor()
-        c.execute('''UPDATE users SET full_name=?, age=?, city=?, balance=?, ref_code=?, invited_by=?,
-                     tasks_done=?, ref_friends=?, ref_progress=?, username=?, last_daily=?, daily_streak=?, weekly_earned=? WHERE user_id=?''',
-                  (user['full_name'], user['age'], user['city'], user['balance'], user['ref_code'], user['invited_by'],
-                   ','.join(map(str, user.get('tasks_done', set()))), ','.join(map(str, user['ref_friends'])), str(user['ref_progress']), user.get('username',''), user.get('last_daily',''), user.get('daily_streak', 0), user.get('weekly_earned', 0), user['user_id']))
-        conn.commit()
-        # Принудительная синхронизация
-        conn.execute('PRAGMA wal_checkpoint(FULL)')
+    # tasks_done, ref_friends, ref_progress сериализуем
+    user_db = user.copy()
+    user_db['tasks_done'] = ','.join(map(str, user.get('tasks_done', set())))
+    user_db['ref_friends'] = ','.join(map(str, user.get('ref_friends', set())))
+    user_db['ref_progress'] = json.dumps(user.get('ref_progress', {}))
+    supabase.table("users").update(user_db).eq("user_id", user['user_id']).execute()
 
 def get_user_by_ref_code(ref_code):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT * FROM users WHERE ref_code=?', (ref_code,))
-        row = c.fetchone()
-    if not row:
+    res = supabase.table("users").select("*").eq("ref_code", ref_code).execute()
+    if not res.data:
         return None
-    # --- Безопасный парсинг tasks_done ---
-    raw_tasks_done = row[7] if len(row) > 7 else ''
-    if not raw_tasks_done or raw_tasks_done in ('{}', 'null', 'None'):
-        tasks_done = set()
-    else:
-        try:
-            tasks_done = set(map(int, raw_tasks_done.split(',')))
-        except Exception as e:
-            logger.error(f"Ошибка парсинга tasks_done (by_ref_code): {raw_tasks_done} ({e})")
-            tasks_done = set()
-    return {
-        'user_id': row[0],
-        'full_name': row[1] or '',
-        'age': row[2] or '',
-        'city': row[3] or '',
-        'balance': row[4],
-        'ref_code': row[5],
-        'invited_by': row[6],
-        'tasks_done': tasks_done,
-        'ref_friends': set(map(int, row[8].split(','))) if row[8] else set(),
-        'ref_progress': eval(row[9]) if row[9] else {},
-        'username': row[10] if len(row) > 10 else '',
-        'last_daily': row[11] if len(row) > 11 else '',
-    }
+    user = res.data[0]
+    user['tasks_done'] = set(map(int, user['tasks_done'].split(','))) if user.get('tasks_done') else set()
+    user['ref_friends'] = set(map(int, user['ref_friends'].split(','))) if user.get('ref_friends') else set()
+    try:
+        user['ref_progress'] = json.loads(user['ref_progress']) if user.get('ref_progress') else {}
+    except (json.JSONDecodeError, TypeError):
+        user['ref_progress'] = {}
+    return user
 
 def send_temp_message(chat_id, text, delay=5, **kwargs):
     msg = bot.send_message(chat_id, text, **kwargs)
@@ -323,7 +246,10 @@ def return_to_main_menu(call=None, user_id=None):
         bot.clear_step_handler_by_chat_id(user_id)
         markup = main_menu_reply_markup(user_id)
         bot.send_message(user_id, "\u2B50 Главное меню:", reply_markup=markup)
-        bot.answer_callback_query(call.id)
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
     elif user_id is not None:
         if hasattr(bot, 'user_data') and user_id in bot.user_data and bot.user_data[user_id].get('task_id'):
             task_name = get_current_task_name(user_id)
@@ -343,43 +269,62 @@ def return_to_main_menu(call=None, user_id=None):
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
-    user = get_user(user_id, message.from_user.username)
-    # Если старт с реферальным кодом
-    ref_name = ''
+    
+    # Обработка реферальных ссылок
     if len(message.text.split()) > 1:
         ref_code = message.text.split()[1]
-        if not user['invited_by'] and ref_code != str(user_id):
-            user['invited_by'] = ref_code
-            save_user(user)
-            inviter = get_user_by_ref_code(ref_code)
-            if inviter:
-                if 'ref_friends' not in inviter or not inviter['ref_friends']:
-                    inviter['ref_friends'] = set()
-                if 'ref_progress' not in inviter or not inviter['ref_progress']:
-                    inviter['ref_progress'] = {}
-                inviter['ref_friends'].add(user_id)
-                inviter['ref_progress'][user_id] = 0
-                save_user(inviter)
-                username = user.get('username')
-                username_str = f" (@{username})" if username else ""
-                bot.send_message(inviter['user_id'], f"К вам присоединился {user['full_name']}{username_str}. Его прогресс: 0/3")
-        inviter = get_user_by_ref_code(user['invited_by']) if user['invited_by'] else None
-        if inviter:
-            ref_name = f"\n\n<b>Тебя пригласил:</b> {inviter['full_name']}"
-    markup = main_menu_reply_markup(user_id)
-    if user['full_name']:
-        # Показываем главное меню с клавиатурой
-        bot.send_message(user_id, "\u2B50 Главное меню:", reply_markup=markup)
+        if ref_code.isdigit():
+            ref_user = get_user_by_ref_code(ref_code)
+            if ref_user and ref_user['user_id'] != user_id:
+                # Сохраняем реферала
+                user = get_user(user_id, message.from_user.username)
+                if not user.get('invited_by'):
+                    user['invited_by'] = ref_code
+                    save_user(user)
+                    # Добавляем в список друзей реферала
+                    ref_user['ref_friends'].add(user_id)
+                    if not isinstance(ref_user['ref_progress'], dict):
+                        ref_user['ref_progress'] = {}
+                    ref_user['ref_progress'][str(user_id)] = 0
+                    save_user(ref_user)
+    
+    user = get_user(user_id, message.from_user.username)
+    # Проверяем, завершена ли регистрация
+    if not user.get('full_name') or not user.get('age') or not user.get('city') or not user.get('phone'):
+        # Приветствие с подчёркнутым словом и инлайн-кнопкой
+        text = (
+            "👋 Привет! Я — Нейро Мэн, твой проводник по игре.\n\n"
+            "Добро пожаловать в увлекательное путешествие, в котором, выполняя задания, ты сможешь получить __Дубли__, которые сможешь обменять на реальные призы!\n\n"
+            "Готов начать? Жми кнопку ниже!"
+        )
+        # Экранируем спецсимволы для MarkdownV2
+        text = text.replace('.', '\\.') \
+                   .replace('!', '\\!') \
+                   .replace('-', '\\-') \
+                   .replace('(', '\\(') \
+                   .replace(')', '\\)')
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("Начать играть", callback_data="start_game"))
+        bot.send_message(user_id, text, reply_markup=markup, parse_mode="MarkdownV2")
         return
-    text = (
-        "<b>👋 Привет! Я — Нейро Мэн, твой проводник по игре.</b>\n\n"
-        "<b>Добро пожаловать в увлекательное путешествие, в котором, выполняя задания, ты сможешь получить <u>Дубли</u>, которые сможешь обменять на реальные призы!</b>\n\n"
-        "Готов начать? Жми кнопку ниже!"
-        f"{ref_name}"
-    )
-    inline = InlineKeyboardMarkup()
-    inline.add(InlineKeyboardButton("🚀 Готов начать", callback_data="start_game"))
-    bot.send_message(user_id, text, reply_markup=inline, parse_mode='HTML')
+        # --- старый код регистрации ниже ---
+        if not user.get('full_name'):
+            bot.send_message(user_id, "Давай зарегистрируемся! Как тебя зовут? (Фамилия и Имя)")
+            bot.register_next_step_handler(message, reg_full_name)
+            return
+        if not user.get('age'):
+            bot.send_message(user_id, "Сколько тебе лет?")
+            bot.register_next_step_handler(message, reg_age)
+            return
+        if not user.get('city'):
+            ask_city(message)
+            return
+        if not user.get('phone'):
+            ask_phone(message)
+            return
+        return
+    # Если регистрация завершена — обычное меню
+    return_to_main_menu(message)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'start_game')
 def start_game_callback(call):
@@ -399,32 +344,46 @@ def start_game_callback(call):
     bot.register_next_step_handler(call.message, reg_full_name)
 
 def reg_full_name(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"reg_full_name: попытка регистрации от бота user_id={message.from_user.id}")
+        return
     user_id = message.from_user.id
     user = get_user(user_id, message.from_user.username)
-    name = message.text.strip()
-    # Валидация: минимум 2 слова, только буквы и пробелы
+    if not getattr(message, 'text', None):
+        bot.send_message(user_id, "Введи Фамилию и Имя (минимум 2 слова, только буквы). Попробуй ещё раз:")
+        bot.register_next_step_handler(message, reg_full_name)
+        return
+    name = str(message.text).strip()
     if len(name.split()) < 2 or not re.match(r'^[А-Яа-яA-Za-zЁё\- ]+$', name):
-        bot.send_message(user_id, "Пожалуйста, введи Фамилию и Имя (минимум 2 слова, только буквы). Попробуй ещё раз:")
+        bot.send_message(user_id, "Введи Фамилию и Имя (минимум 2 слова, только буквы). Попробуй ещё раз:")
         bot.register_next_step_handler(message, reg_full_name)
         return
     name = ' '.join([part.capitalize() for part in name.split()])
     user['full_name'] = name
+    print(f"reg_full_name: save_user {user_id}")
     save_user(user)
     bot.send_message(user_id, "Сколько тебе лет?")
     bot.register_next_step_handler(message, reg_age)
 
 def reg_age(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"reg_age: попытка регистрации от бота user_id={message.from_user.id}")
+        return
     user_id = message.from_user.id
     user = get_user(user_id, message.from_user.username)
-    if not message.text.isdigit():
-        send_temp_message(user_id, "Пожалуйста, введи число.")
+    if not getattr(message, 'text', None):
+        bot.send_message(user_id, "Введи возраст числом. Попробуй ещё раз:")
+        bot.register_next_step_handler(message, reg_age)
+        return
+    if not str(message.text).isdigit():
+        bot.send_message(user_id, "Введи возраст числом. Попробуй ещё раз:")
         bot.register_next_step_handler(message, reg_age)
         return
     try:
         age = int(message.text)
-    except ValueError as e:
+    except Exception as e:
         logger.error(f"Ошибка парсинга возраста: {message.text} ({e})")
-        send_temp_message(user_id, "Пожалуйста, введи корректный возраст.")
+        bot.send_message(user_id, "Введи возраст числом. Попробуй ещё раз:")
         bot.register_next_step_handler(message, reg_age)
         return
     if age < 10 or age > 100:
@@ -432,52 +391,137 @@ def reg_age(message):
         bot.register_next_step_handler(message, reg_age)
         return
     user['age'] = age
+    print(f"reg_age: save_user {user_id}")
     save_user(user)
-    # --- Новый выбор города ---
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    ask_city(message)
+
+def ask_city(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"ask_city: попытка регистрации от бота user_id={message.from_user.id}")
+        return
+    user_id = message.from_user.id
+    markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
         telebot.types.InlineKeyboardButton("Ростов-на-Дону", callback_data="city_rostov"),
         telebot.types.InlineKeyboardButton("Другой город", callback_data="city_other")
     )
-    bot.send_message(user_id, "Из какого ты города по прописке?", reply_markup=markup)
+    bot.send_message(user_id, "Выбери свой город:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data in ["city_rostov", "city_other"])
 def city_choice_callback(call):
+    if getattr(call.from_user, 'is_bot', False):
+        print(f"city_choice_callback: попытка регистрации от бота user_id={call.from_user.id}")
+        return
     user_id = call.from_user.id
     user = get_user(user_id, call.from_user.username)
     if call.data == "city_rostov":
         user['city'] = "Ростов-на-Дону"
-        user['balance'] += 25
+        print(f"city_choice_callback: save_user {user_id}")
         save_user(user)
-        first_name = user['full_name'].split()[1] if len(user['full_name'].split()) > 1 else user['full_name'].split()[0]
-        bot.edit_message_text(
-            f"<b>Поздравляем, игрок «{first_name}» зарегистрирован!</b>\n\n+25 дублей за регистрацию.\n\nПоехали!",
-            call.message.chat.id, call.message.message_id, parse_mode='HTML'
-        )
-        return_to_main_menu(None, user_id)
+        # Передаём фейковый message с нужными полями для ask_phone
+        class FakeMessage:
+            def __init__(self, from_user, chat):
+                self.from_user = from_user
+                self.chat = chat
+        fake_message = FakeMessage(call.from_user, call.message.chat)
+        ask_phone(fake_message)
     else:
         bot.edit_message_text("Введи свой город по прописке:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler_by_chat_id(user_id, reg_city_manual)
 
 def reg_city_manual(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"reg_city_manual: попытка регистрации от бота user_id={message.from_user.id}")
+        return
     user_id = message.from_user.id
     user = get_user(user_id, message.from_user.username)
-    city = message.text.strip().lower().replace('ё', 'е')
-    # Валидация: только буквы, минимум 2 буквы
-    if not re.match(r'^[а-яa-z\- ]{2,}$', city, re.IGNORECASE):
-        bot.send_message(user_id, "Пожалуйста, введи корректное название города (только буквы, минимум 2 буквы). Попробуй ещё раз:")
+    if not getattr(message, 'text', None):
+        bot.send_message(user_id, "Введи корректное название города (только буквы, минимум 2 буквы). Попробуй ещё раз:")
         bot.register_next_step_handler(message, reg_city_manual)
         return
-        city = ' '.join([part.capitalize() for part in city.split()])
+    city = str(message.text).strip().lower().replace('ё', 'е')
+    if not re.match(r'^[а-яa-z\- ]{2,}$', city, re.IGNORECASE):
+        bot.send_message(user_id, "Введи корректное название города (только буквы, минимум 2 буквы). Попробуй ещё раз:")
+        bot.register_next_step_handler(message, reg_city_manual)
+        return
+    city = ' '.join([part.capitalize() for part in city.split()])
     user['city'] = city
-    user['balance'] += 25
+    print(f"reg_city_manual: save_user {user_id}")
     save_user(user)
-    first_name = user['full_name'].split()[1] if len(user['full_name'].split()) > 1 else user['full_name'].split()[0]
+    ask_phone(message)
+
+def ask_phone(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"ask_phone: попытка регистрации от бота user_id={message.from_user.id}")
+        return
+    user_id = message.from_user.id
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(KeyboardButton("📱 Отправить номер из Telegram", request_contact=True))
+    markup.add(KeyboardButton("✍️ Ввести номер вручную"))
+    bot.send_message(user_id, "Укажи свой номер телефона:", reply_markup=markup)
+    bot.register_next_step_handler(message, handle_phone)
+
+def handle_phone(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"handle_phone: попытка регистрации от бота user_id={message.from_user.id}")
+        return
+    user_id = message.from_user.id
+    user = get_user(user_id, message.from_user.username)
+    phone = None
+    if hasattr(message, 'contact') and message.contact and getattr(message.contact, 'phone_number', None):
+        phone = str(message.contact.phone_number)
+    elif getattr(message, 'text', None) and "ввести" in message.text.lower():
+        bot.send_message(user_id, "Введи номер телефона в формате +7XXXXXXXXXX:")
+        bot.register_next_step_handler(message, handle_phone_manual)
+        return
+    elif getattr(message, 'text', None):
+        phone = str(message.text).strip()
+    if not phone or not re.match(r'^\+?\d{10,15}$', phone):
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(KeyboardButton("📱 Отправить номер из Telegram", request_contact=True))
+        markup.add(KeyboardButton("✍️ Ввести номер вручную"))
+        bot.send_message(user_id, "Укажи свой номер телефона через Telegram или введи вручную:", reply_markup=markup)
+        bot.register_next_step_handler(message, handle_phone)
+        return
+    user['phone'] = phone
+    user['balance'] += 25
+    print(f"handle_phone: save_user {user_id}")
+    save_user(user)
+    first_name = str(user.get('full_name', '')).split()[1] if len(str(user.get('full_name', '')).split()) > 1 else str(user.get('full_name', '')).split()[0] if user.get('full_name', '') else ''
     bot.send_message(
         user_id,
         f"<b>Поздравляем, игрок «{first_name}» зарегистрирован!</b>\n\n+25 дублей за регистрацию.\n\nПоехали!",
         parse_mode='HTML'
     )
+    bot.clear_step_handler_by_chat_id(user_id)
+    return_to_main_menu(None, user_id)
+
+def handle_phone_manual(message):
+    if getattr(message.from_user, 'is_bot', False):
+        print(f"handle_phone_manual: попытка регистрации от бота user_id={message.from_user.id}")
+        return
+    user_id = message.from_user.id
+    user = get_user(user_id, message.from_user.username)
+    if not getattr(message, 'text', None):
+        bot.send_message(user_id, "Введи номер телефона в формате +7XXXXXXXXXX:")
+        bot.register_next_step_handler(message, handle_phone_manual)
+        return
+    phone = str(message.text).strip()
+    if not re.match(r'^\+?\d{10,15}$', phone):
+        bot.send_message(user_id, "Введи номер телефона в формате +7XXXXXXXXXX:")
+        bot.register_next_step_handler(message, handle_phone_manual)
+        return
+    user['phone'] = phone
+    user['balance'] += 25
+    print(f"handle_phone_manual: save_user {user_id}")
+    save_user(user)
+    first_name = str(user.get('full_name', '')).split()[1] if len(str(user.get('full_name', '')).split()) > 1 else str(user.get('full_name', '')).split()[0] if user.get('full_name', '') else ''
+    bot.send_message(
+        user_id,
+        f"<b>Поздравляем, игрок «{first_name}» зарегистрирован!</b>\n\n+25 дублей за регистрацию.\n\nПоехали!",
+        parse_mode='HTML'
+    )
+    bot.clear_step_handler_by_chat_id(user_id)
     return_to_main_menu(None, user_id)
 
 # --- Меню ---
@@ -495,12 +539,10 @@ def show_balance(message, back_btn=False):
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Про игру")
 def about_game(message, back_btn=False):
-    if block_if_open_task(message):
-        return
     text = (
         "<b>О проекте</b>\n\n"
         "Простая, но интересная игра, в которой ты можешь выполнять задания в течение 3 месяцев, получать <b>дубли</b> и обменивать их на реальные призы!\n\n"
-        "С нами ты лучше изучишь город, поучаствуешь в творческих акциях, узнаешь много нового и классно проведешь время.\n\n"
+        "С нами ты лучше изучишь город, поучаствуешь в творческих акциях, узнаешь много нового и классно проведёшь время.\n\n"
         "<b>Типы заданий:</b>\n• Ежедневные\n• Еженедельные\n\n"
         "<b>За что начисляются дубли:</b>\n"
         "• Выполнение заданий\n"
@@ -516,8 +558,6 @@ def about_game(message, back_btn=False):
 
 @bot.message_handler(func=lambda m: m.text == "📜 Правила")
 def rules(message, back_btn=False):
-    if block_if_open_task(message):
-        return
     text = (
         "<b>Правила игры и обмена дублей на призы</b>\n\n"
         "1️⃣ <b>Рассказывай всем об этой игре!</b>\n"
@@ -526,18 +566,17 @@ def rules(message, back_btn=False):
         "<b>Обмен дублей на призы:</b>\n"
         "• Минимум для обмена — 400 дублей\n"
         "• Призы — смотри во вкладке <b>Обменять дубли на призы</b>\n"
-        "• Победа в недельном рейтинге игроков"
+        "• Дубли начисляются только после проверки задания модератором\n"
+        "• За нарушения правил — дисквалификация без возврата дублей\n"
+        "\nУдачи и честной игры!"
     )
     if back_btn:
         bot.edit_message_text(text, message.message.chat.id, message.message.message_id, parse_mode='HTML', reply_markup=back_markup())
     else:
         bot.send_message(message.from_user.id, text, parse_mode='HTML')
 
-# --- Задания ---
 @bot.message_handler(func=lambda m: m.text == "📋 Список заданий")
 def task_list(message, back_btn=False):
-    if block_if_open_task(message):
-        return
     remind_daily_bonus(message.from_user.id)
     user_id = message.from_user.id
     # Защита: нельзя переходить, если есть незавершённое задание
@@ -618,8 +657,8 @@ def do_task(call):
     if not hasattr(bot, 'user_data'):
         bot.user_data = {}
     bot.user_data[user_id] = {'task_id': task_id, 'msg_id': call.message.message_id}
-    bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
-    bot.register_next_step_handler(call.message, handle_proof, task_id)
+    msg = bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+    bot.register_next_step_handler(msg, handle_proof, task_id)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'cancel_proof')
 def cancel_proof(call):
@@ -641,9 +680,15 @@ def handle_proof(message, task_id):
     proof_type = 'photo'
     proof_data = message.photo[-1].file_id
     add_pending_task(user_id, task_id, proof_type, proof_data)
-    send_temp_message(user_id, "✅ Задание отправлено на проверку! Пока оно проверяется, ты можешь выполнять другие задания.", delay=10)
-    # Синхронизируем БД
-    sync_database()
+    markup_return = InlineKeyboardMarkup()
+    markup_return.add(InlineKeyboardButton("📋 Вернуться к заданиям", callback_data="menu_tasks"))
+    send_temp_message(user_id, "✅ Задание отправлено на проверку! Пока оно проверяется, ты можешь выполнять другие задания.", delay=10, reply_markup=markup_return)
+    # После отправки на проверку — удаляем task_id из user_data и сообщение с описанием задания
+    if hasattr(bot, 'user_data') and user_id in bot.user_data:
+        msg_id = bot.user_data[user_id].pop('msg_id', None)
+        bot.user_data[user_id].pop('task_id', None)
+        if msg_id:
+            safe_delete_message(user_id, msg_id)
     # Загружаем свежие задания для получения актуального названия
     global tasks
     tasks = get_fresh_tasks()
@@ -660,11 +705,11 @@ def handle_proof(message, task_id):
     markup.add(InlineKeyboardButton("✅ Принять", callback_data=f"approve_{user_id}_{task_id}"),
                InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user_id}_{task_id}"))
     if proof_type == 'photo':
-        bot.send_photo(GROUP_ID, proof_data, caption=text, parse_mode='HTML', reply_markup=markup, message_thread_id=TASKS_TOPIC_ID)
+        bot.send_photo(GROUP_ID, proof_data, caption=text, parse_mode='HTML', reply_markup=markup)
     elif proof_type == 'document':
-        bot.send_document(GROUP_ID, proof_data, caption=text, parse_mode='HTML', reply_markup=markup, message_thread_id=TASKS_TOPIC_ID)
+        bot.send_document(GROUP_ID, proof_data, caption=text, parse_mode='HTML', reply_markup=markup)
     else:
-        bot.send_message(GROUP_ID, text + f"\n\nПруф: {proof_data}", parse_mode='HTML', reply_markup=markup, message_thread_id=TASKS_TOPIC_ID)
+        bot.send_message(GROUP_ID, text + f"\n\nПруф: {proof_data}", parse_mode='HTML', reply_markup=markup)
 
 # --- Рефералы ---
 @bot.message_handler(func=lambda m: m.text == "👥 Реферальная программа")
@@ -730,8 +775,9 @@ def exchange_prizes(message, back_btn=False):
     # Кнопка маркетплейса только если >= 400 дублей
     if user['balance'] >= 400:
         markup.add(InlineKeyboardButton("🛒 Обменять дубли на товар с маркетплейса", callback_data="marketplace_prize"))
-    # Добавляю инфо-блок про маркетплейс
+    # Инфо-блок про маркетплейс (вернуть старую формулировку)
     text += "\n<b>Также можете обменять Дубли на товары с маркетплейсов, если дублей не меньше стоимости товара (минимум 400)</b>"
+    text += "\n<i>Возможность обмена дублей на призы откроется после накопления 400 дублей.</i>"
     if back_btn:
         bot.edit_message_text(text, message.message.chat.id, message.message.message_id, parse_mode='HTML', reply_markup=markup)
     else:
@@ -799,12 +845,17 @@ def handle_marketplace_prize(message):
         link_or_name = str(text.replace(str(cost), '').strip() or '')
     safe_full_name = str(user.get('full_name') or '')
     safe_link_or_name = str(link_or_name or '')
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('''INSERT INTO prize_requests (user_id, prize_name, prize_cost, user_balance, additional_info, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                  (user_id, '[МАРКЕТПЛЕЙС]', cost, user['balance'], safe_link_or_name, 'pending', datetime.now().isoformat()))
-        request_id = c.lastrowid
-        conn.commit()
+    # --- Supabase insert ---
+    res = supabase.table("prize_requests").insert({
+        'user_id': user_id,
+        'prize_name': '[МАРКЕТПЛЕЙС]',
+        'prize_cost': cost,
+        'user_balance': user['balance'],
+        'additional_info': safe_link_or_name,
+        'status': 'pending',
+        'created_at': datetime.now().isoformat()
+    }).execute()
+    request_id = res.data[0]['id'] if res.data and 'id' in res.data[0] else None
     user['balance'] -= cost
     save_user(user)
     desc = f"Пользователь: <a href='tg://user?id={user_id}'>{safe_full_name}</a>\nПриз с маркетплейса: {safe_link_or_name}\nСтоимость: {cost} дублей\nID заявки: {request_id}"
@@ -814,13 +865,10 @@ def handle_marketplace_prize(message):
         InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_marketplace_{request_id}")
     )
     if file_id:
-        msg = bot.send_photo(GROUP_ID, file_id, caption=desc, parse_mode='HTML', message_thread_id=MARKETPLACE_TOPIC_ID, reply_markup=markup)
+        msg = bot.send_photo(GROUP_ID, file_id, caption=desc, parse_mode='HTML', reply_markup=markup)
     else:
-        msg = bot.send_message(GROUP_ID, desc, parse_mode='HTML', message_thread_id=MARKETPLACE_TOPIC_ID, reply_markup=markup)
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('UPDATE prize_requests SET group_message_id=? WHERE id=?', (msg.message_id, request_id))
-        conn.commit()
+        msg = bot.send_message(GROUP_ID, desc, parse_mode='HTML', reply_markup=markup)
+    supabase.table("prize_requests").update({'group_message_id': msg.message_id}).eq("id", request_id).execute()
     bot.send_message(user_id, f"✅ Заявка на приз с маркетплейса отправлена! Списано: {cost} дублей. Ожидайте подтверждения.", reply_markup=telebot.types.ReplyKeyboardRemove())
 
 @bot.callback_query_handler(func=lambda call: call.data == 'cancel_support')
@@ -836,30 +884,26 @@ def handle_marketplace_moderation(call):
     data = call.data
     approve = data.startswith('approve_marketplace_')
     request_id = int(data.split('_')[-1])
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT user_id, prize_cost, group_message_id FROM prize_requests WHERE id=?', (request_id,))
-        row = c.fetchone()
-        if not row:
-            bot.answer_callback_query(call.id, "Заявка не найдена")
-            return
-        user_id, cost, group_msg_id = row
-        if approve:
-            c.execute('UPDATE prize_requests SET status=? WHERE id=?', ('approved', request_id))
-            conn.commit()
-            bot.send_message(user_id, "🎉 Ваша заявка на приз с маркетплейса одобрена! Ожидайте, с вами свяжутся для выдачи приза.")
-            bot.edit_message_reply_markup(GROUP_ID, group_msg_id, reply_markup=None)
-            bot.answer_callback_query(call.id, "Одобрено")
-        else:
-            c.execute('UPDATE prize_requests SET status=? WHERE id=?', ('rejected', request_id))
-            conn.commit()
-            # Возвращаем дубли
-            user = get_user(user_id)
-            user['balance'] += cost
-            save_user(user)
-            bot.send_message(user_id, "❌ Ваша заявка на приз с маркетплейса отклонена. Дубли возвращены на баланс.")
-            bot.edit_message_reply_markup(GROUP_ID, group_msg_id, reply_markup=None)
-            bot.answer_callback_query(call.id, "Отклонено")
+    res = supabase.table("prize_requests").select("user_id, prize_cost, group_message_id").eq("id", request_id).execute()
+    if not res.data:
+        bot.answer_callback_query(call.id, "Заявка не найдена")
+        return
+    user_id = res.data[0]['user_id']
+    cost = res.data[0]['prize_cost']
+    group_msg_id = res.data[0]['group_message_id']
+    if approve:
+        supabase.table("prize_requests").update({'status': 'approved'}).eq("id", request_id).execute()
+        bot.send_message(user_id, "🎉 Ваша заявка на приз с маркетплейса одобрена! Ожидайте, с вами свяжутся для выдачи приза.")
+        bot.edit_message_reply_markup(GROUP_ID, group_msg_id, reply_markup=None)
+        bot.answer_callback_query(call.id, "Одобрено")
+    else:
+        supabase.table("prize_requests").update({'status': 'rejected'}).eq("id", request_id).execute()
+        user = get_user(user_id)
+        user['balance'] += cost
+        save_user(user)
+        bot.send_message(user_id, "❌ Ваша заявка на приз с маркетплейса отклонена. Дубли возвращены на баланс.")
+        bot.edit_message_reply_markup(GROUP_ID, group_msg_id, reply_markup=None)
+        bot.answer_callback_query(call.id, "Отклонено")
 
 
 
@@ -901,22 +945,17 @@ def save_support(message):
     
     # Отправляем в группу и сохраняем ID сообщения
     try:
-        msg = bot.send_message(GROUP_ID, text, parse_mode='HTML', message_thread_id=SUPPORT_TOPIC_ID)
+        msg = bot.send_message(GROUP_ID, text, parse_mode='HTML')
         support_messages.append({
             'user_id': user_id, 
             'text': message.text, 
             'group_message_id': msg.message_id,
             'timestamp': datetime.now().isoformat()
         })
-        # Отправляем подтверждение пользователю
         send_temp_message(user_id, "Спасибо! Ваш вопрос отправлен в поддержку. Ожидайте ответа.", delay=10)
     except Exception as e:
         logger.error(f"Ошибка отправки обращения в группу: {e}")
-        # Если не удалось отправить в группу, отправляем админу
-    if admin_id:
-        bot.send_message(admin_id, f"Вопрос от пользователя {user_id}: {message.text}")
     send_temp_message(user_id, "Спасибо! Ваш вопрос отправлен в поддержку.", delay=10)
-    # После отправки вопроса возвращаем в главное меню
     support_states.discard(user_id)
     return_to_main_menu(None, user_id)
 
@@ -925,21 +964,15 @@ def export_users(message):
     if message.from_user.id != admin_id:
         bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
         return
-    # Принудительная синхронизация БД
-    with sqlite3.connect('users.db') as conn:
-        conn.execute('PRAGMA wal_checkpoint(FULL)')
-        conn.commit()
-        c = conn.cursor()
-        c.execute('SELECT * FROM users')
-        rows = c.fetchall()
+    users, columns = get_all_users()
     filename = 'users_export.csv'
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['user_id', 'full_name', 'age', 'city', 'balance', 'ref_code', 'invited_by', 'ref_friends', 'ref_progress', 'tasks_done', 'weekly_earned'])
-        for row in rows:
-            writer.writerow(row)
-        f.flush()  # Принудительная запись на диск
-        os.fsync(f.fileno())  # Синхронизация с файловой системой
+        writer.writerow(columns)
+        for u in users:
+            writer.writerow([u.get(col, '') for col in columns])
+        f.flush()
+        os.fsync(f.fileno())
     with open(filename, 'rb') as f:
         bot.send_document(admin_id, f, caption='Выгрузка пользователей')
 
@@ -951,17 +984,34 @@ def admin_export_users(message):
         return
     export_users(message)
 
+@bot.message_handler(func=lambda m: m.text == "🏆 Рейтинг недели")
+def weekly_rating(message):
+    user_id = message.from_user.id
+    # Всегда читаем актуальные данные из Supabase по балансу
+    res = supabase.table('users').select('user_id,full_name,balance').order('balance', desc=True).order('user_id', desc=False).limit(100).execute()
+    rows = res.data
+    top = rows[:10]
+    text = '<b>🏆 Топ-10 по балансу:</b>\n'
+    for i, row in enumerate(top, 1):
+        text += f"{i}. {row['full_name']} — {row['balance']} {plural_dubl(row['balance'])}\n"
+    # Место пользователя
+    place = next((i+1 for i, row in enumerate(rows) if row['user_id']==user_id), None)
+    my_balance = next((row['balance'] for row in rows if row['user_id']==user_id), 0)
+    if place:
+        text += f"\n<b>Твоё место:</b> {place} из {len(rows)} (у тебя {my_balance} {plural_dubl(my_balance)})"
+    else:
+        text += "\nТы пока не в рейтинге."
+    bot.send_message(user_id, text, parse_mode='HTML')
+
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика")
 def admin_stats(message):
     if message.from_user.id != admin_id:
         bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
         return
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM users')
-        total = c.fetchone()[0]
-        c.execute('SELECT COUNT(*) FROM users WHERE balance >= 400')
-        rich = c.fetchone()[0]
+    res = supabase.table('users').select('user_id,balance').execute()
+    rows = res.data
+    total = len(rows)
+    rich = sum(1 for row in rows if row['balance'] >= 400)
     bot.send_message(admin_id, f"Всего пользователей: <b>{total}</b>\n\nС балансом 400+ дублей: <b>{rich}</b>", parse_mode='HTML')
 
 @bot.message_handler(func=lambda m: m.text == "👤 Пользователи")
@@ -969,13 +1019,29 @@ def admin_users(message):
     if message.from_user.id != admin_id:
         bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
         return
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT user_id, full_name, balance FROM users LIMIT 20')
-        rows = c.fetchall()
+    res = supabase.table('users').select('user_id,full_name,balance').limit(20).execute()
+    rows = res.data
     text = '<b>Первые 20 пользователей:</b>\n'
     for row in rows:
-        text += f"ID: <code>{row[0]}</code> | {row[1]} | 💰 {row[2]} дублей\n"
+        text += f"ID: <code>{row['user_id']}</code> | {row['full_name']} | 💰 {row['balance']} дублей\n"
+    bot.send_message(admin_id, text, parse_mode='HTML')
+
+@bot.message_handler(func=lambda m: m.text == "🏆 Топ рейтинг")
+def admin_top_rating(message):
+    if message.from_user.id != admin_id:
+        bot.send_message(message.from_user.id, "⛔️ Нет доступа.")
+        return
+    res = supabase.table('users').select('user_id,full_name,balance').order('balance', desc=True).order('user_id', desc=False).limit(100).execute()
+    rows = res.data
+    text = '<b>🏆 Топ-10 по балансу:</b>\n'
+    for i, row in enumerate(rows[:10], 1):
+        text += f"{i}. {row['full_name']} — {row['balance']} {plural_dubl(row['balance'])}\n"
+    place = next((i+1 for i, row in enumerate(rows) if row['user_id']==admin_id), None)
+    my_balance = next((row['balance'] for row in rows if row['user_id']==admin_id), 0)
+    if place:
+        text += f"\n<b>Твоё место:</b> {place} из {len(rows)} (у тебя {my_balance} {plural_dubl(my_balance)})"
+    else:
+        text += "\nТы пока не в рейтинге."
     bot.send_message(admin_id, text, parse_mode='HTML')
 
 @bot.message_handler(func=lambda m: m.text == "📨 Обращения")
@@ -1089,7 +1155,9 @@ def handle_main_menu(call):
         text += "<b>Обмен дублей на призы:</b>\n"
         text += "• Минимум для обмена — 400 дублей\n"
         text += "• Призы — смотри во вкладке <b>Обменять дубли на призы</b>\n"
-        text += "• Победа в недельном рейтинге игроков"
+        text += "• Дубли начисляются только после проверки задания модератором\n"
+        text += "• За нарушения правил — дисквалификация без возврата дублей\n"
+        "\nУдачи и честной игры!"
         markup = back_markup()
         show_section(call, text, markup)
     elif data == "menu_support":
@@ -1165,60 +1233,50 @@ def handle_admin_panel(call):
         bot.register_next_step_handler_by_chat_id(admin_id, admin_broadcast_step)
         return
     elif data == "admin_stats":
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('SELECT COUNT(*) FROM users')
-            total = c.fetchone()[0]
-            c.execute('SELECT COUNT(*) FROM users WHERE balance >= 400')
-            rich = c.fetchone()[0]
+        res = supabase.table('users').select('user_id,balance').execute()
+        rows = res.data
+        total = len(rows)
+        rich = sum(1 for row in rows if row['balance'] >= 400)
         text = f"Всего пользователей: <b>{total}</b>\n\nС балансом 400+ дублей: <b>{rich}</b>"
         markup = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_panel"))
         show_section(call, text, markup)
     elif data == "admin_users":
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('SELECT user_id, full_name, balance FROM users LIMIT 20')
-            rows = c.fetchall()
+        res = supabase.table('users').select('user_id,full_name,balance').limit(20).execute()
+        rows = res.data
         text = '<b>Первые 20 пользователей:</b>\n'
         for row in rows:
-            text += f"ID: <code>{row[0]}</code> | {row[1]} | 💰 {row[2]} дублей\n"
+            text += f"ID: <code>{row['user_id']}</code> | {row['full_name']} | 💰 {row['balance']} дублей\n"
         markup = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ В меню админа", callback_data="admin_panel"))
         show_section(call, text, markup)
     elif data == "admin_export":
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('SELECT * FROM users')
-            rows = c.fetchall()
+        res = supabase.table('users').select('*').execute()
+        rows = res.data
         filename = 'users_export.csv'
         import csv
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['user_id', 'full_name', 'age', 'city', 'balance', 'ref_code', 'invited_by', 'ref_friends', 'ref_progress', 'tasks_done', 'weekly_earned'])
             for row in rows:
-                writer.writerow(row)
+                writer.writerow([
+                    row.get('user_id'), row.get('full_name'), row.get('age'), row.get('city'), row.get('balance'),
+                    row.get('ref_code'), row.get('invited_by'), row.get('ref_friends'), row.get('ref_progress'),
+                    row.get('tasks_done'), row.get('weekly_earned')
+                ])
         with open(filename, 'rb') as f:
             bot.send_document(admin_id, f, caption='Выгрузка пользователей')
         bot.answer_callback_query(call.id, "Выгрузка отправлена!")
     elif data == "admin_new_week":
-        # Сброс weekly_earned для всех пользователей
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('UPDATE users SET weekly_earned=0')
-            conn.commit()
+        supabase.table('users').update({'weekly_earned': 0}).neq('user_id', 0).execute()
         bot.answer_callback_query(call.id, "✅ Новая неделя началась! Рейтинг сброшен.")
         return
     elif data == "admin_top_rating":
-        # Показать топ-10 по балансу
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('SELECT user_id, full_name, balance FROM users ORDER BY balance DESC, user_id ASC LIMIT 100')
-            rows = c.fetchall()
+        res = supabase.table('users').select('user_id,full_name,balance').order('balance', desc=True).order('user_id', desc=False).limit(100).execute()
+        rows = res.data
         text = '<b>🏆 Топ-10 по балансу:</b>\n'
-        for i, row in enumerate(rows, 1):
-            text += f"{i}. {row[1]} — {row[2]} {plural_dubl(row[2])}\n"
-        # Место пользователя
-        place = next((i+1 for i, row in enumerate(rows) if row[0]==user_id), None)
-        my_balance = next((row[2] for row in rows if row[0]==user_id), 0)
+        for i, row in enumerate(rows[:10], 1):
+            text += f"{i}. {row['full_name']} — {row['balance']} {plural_dubl(row['balance'])}\n"
+        place = next((i+1 for i, row in enumerate(rows) if row['user_id']==user_id), None)
+        my_balance = next((row['balance'] for row in rows if row['user_id']==user_id), 0)
         if place:
             text += f"\n<b>Твоё место:</b> {place} из {len(rows)} (у тебя {my_balance} {plural_dubl(my_balance)})"
         else:
@@ -1226,20 +1284,7 @@ def handle_admin_panel(call):
         bot.send_message(user_id, text, parse_mode='HTML')
         return
     elif data == "admin_reset_balances":
-        # Сброс всех балансов (с подтверждением)
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("❌ Подтвердить сброс", callback_data="admin_confirm_reset_balances"),
-            InlineKeyboardButton("Отмена", callback_data="admin_panel")
-        )
-        bot.send_message(admin_id, "⚠️ ВНИМАНИЕ! Это сбросит ВСЕ балансы пользователей на 0. Подтверди действие:", reply_markup=markup)
-        return
-    elif data == "admin_confirm_reset_balances":
-        # Подтвержденный сброс всех балансов
-        with sqlite3.connect('users.db') as conn:
-            c = conn.cursor()
-            c.execute('UPDATE users SET balance=0')
-            conn.commit()
+        supabase.table('users').update({'balance': 0}).neq('user_id', 0).execute()
         bot.send_message(admin_id, "✅ Все балансы сброшены на 0!")
         show_admin_panel(call)
         return
@@ -1339,11 +1384,8 @@ def admin_confirm_delete(call):
         logger.error(f"Ошибка парсинга uid в admin_confirm_delete: {call.data} ({e})")
         bot.answer_callback_query(call.id, "Ошибка данных. Сообщи админу!")
         return
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('DELETE FROM pending_tasks WHERE user_id=?', (uid,))
-        c.execute('DELETE FROM users WHERE user_id=?', (uid,))
-        conn.commit()
+    supabase.table("pending_tasks").delete().eq("user_id", uid).execute()
+    supabase.table("users").delete().eq("user_id", uid).execute()
     bot.send_message(admin_id, f"Пользователь {uid} удалён.")
     show_admin_panel(call)
 
@@ -1366,10 +1408,8 @@ def admin_broadcast_send(call):
     if not text:
         bot.send_message(admin_id, "Нет текста для рассылки.")
         return
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT user_id FROM users')
-        user_ids = [row[0] for row in c.fetchall()]
+    res = supabase.table("users").select("user_id").execute()
+    user_ids = [row['user_id'] for row in res.data]
     count = 0
     for uid in user_ids:
         try:
@@ -1405,50 +1445,48 @@ def back_markup():
 
 # --- Функции для работы с pending_tasks ---
 def add_pending_task(user_id, task_id, proof_type, proof_data):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('INSERT INTO pending_tasks (user_id, task_id, proof_type, proof_data, status) VALUES (?, ?, ?, ?, ?)',
-                  (user_id, task_id, proof_type, proof_data, 'pending'))
-        conn.commit()
+    supabase.table("pending_tasks").insert({
+        'user_id': user_id,
+        'task_id': task_id,
+        'proof_type': proof_type,
+        'proof_data': proof_data,
+        'status': 'pending'
+    }).execute()
 
 def get_pending_tasks():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT id, user_id, task_id, proof_type, proof_data FROM pending_tasks WHERE status="pending"')
-        rows = c.fetchall()
-    return rows
+    res = supabase.table("pending_tasks").select("id, user_id, task_id, proof_type, proof_data").eq("status", "pending").execute()
+    if not res.data:
+        return []
+    return [(row['id'], row['user_id'], row['task_id'], row['proof_type'], row['proof_data']) for row in res.data]
 
 def set_pending_task_status(task_id, status):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('UPDATE pending_tasks SET status=? WHERE id=?', (status, task_id))
-        conn.commit()
+    supabase.table("pending_tasks").update({'status': status}).eq("id", task_id).execute()
 
 # --- Функции для работы с заявками на призы ---
 def add_prize_request(user_id, prize_name, prize_cost, user_balance, additional_info=""):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('''INSERT INTO prize_requests (user_id, prize_name, prize_cost, user_balance, additional_info, created_at) 
-                     VALUES (?, ?, ?, ?, ?, ?)''',
-                  (user_id, prize_name, prize_cost, user_balance, additional_info, datetime.now().isoformat()))
-        conn.commit()
-        return c.lastrowid
+    res = supabase.table("prize_requests").insert({
+        'user_id': user_id,
+        'prize_name': prize_name,
+        'prize_cost': prize_cost,
+        'user_balance': user_balance,
+        'additional_info': additional_info,
+        'status': 'pending',
+        'created_at': datetime.now().isoformat()
+    }).execute()
+    # Возвращаем id заявки
+    if res.data and 'id' in res.data[0]:
+        return res.data[0]['id']
+    return None
 
 def get_pending_prize_requests():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT * FROM prize_requests WHERE status="pending" ORDER BY created_at DESC')
-        rows = c.fetchall()
-    return rows
+    res = supabase.table("prize_requests").select("*").eq("status", "pending").order("created_at", desc=True).execute()
+    return [tuple(row.values()) for row in res.data]
 
 def set_prize_request_status(request_id, status, group_message_id=None):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        if group_message_id:
-            c.execute('UPDATE prize_requests SET status=?, group_message_id=? WHERE id=?', (status, group_message_id, request_id))
-        else:
-            c.execute('UPDATE prize_requests SET status=? WHERE id=?', (status, request_id))
-        conn.commit()
+    update_data = {'status': status}
+    if group_message_id:
+        update_data['group_message_id'] = group_message_id
+    supabase.table("prize_requests").update(update_data).eq("id", request_id).execute()
 
 # --- Обработка кнопок проверки ---
 @bot.callback_query_handler(func=lambda call: (call.data.startswith('approve_') or call.data.startswith('reject_')) and not call.data.startswith('approve_prize_') and not call.data.startswith('reject_prize_') and not call.data.startswith('approve_marketplace_') and not call.data.startswith('reject_marketplace_'))
@@ -1462,15 +1500,12 @@ def handle_task_moderation(call):
         logger.error(f"Ошибка парсинга user_id/task_id в handle_task_moderation: {data} ({e})")
         bot.answer_callback_query(call.id, "Ошибка данных. Сообщи админу!")
         return
-    # Найти заявку
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT id FROM pending_tasks WHERE user_id=? AND task_id=? AND status="pending"', (user_id, task_id))
-        row = c.fetchone()
-    if not row:
+    # Найти заявку через Supabase
+    res = supabase.table("pending_tasks").select("id").eq("user_id", user_id).eq("task_id", task_id).eq("status", "pending").execute()
+    if not res.data:
         bot.answer_callback_query(call.id, "Заявка уже обработана")
         return
-    pending_id = row[0]
+    pending_id = res.data[0]['id']
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("Вернуться к заданиям", callback_data="menu_tasks"))
     if action == 'approve':
@@ -1483,13 +1518,8 @@ def handle_task_moderation(call):
         user['weekly_earned'] = user.get('weekly_earned', 0) + reward
         user['tasks_done'].add(task_id)
         save_user(user)
-        add_user_task(user_id, task_id)
-        # Синхронизируем БД после изменения
-        sync_database()
-        # --- Снимаем защиту: удаляем task_id из user_data ---
         if hasattr(bot, 'user_data') and user_id in bot.user_data:
             bot.user_data[user_id].pop('task_id', None)
-        # --- Реферальная логика ---
         if user.get('invited_by'):
             inviter = get_user_by_ref_code(user['invited_by'])
             if inviter:
@@ -1502,10 +1532,9 @@ def handle_task_moderation(call):
                 save_user(inviter)
                 save_user(user)
                 if inviter['ref_progress'][user_id] == 3:
-                    # Проверяем, не была ли уже выдана награда
                     awarded_key = f"awarded_{user_id}"
                     if awarded_key not in inviter['ref_progress']:
-                        inviter['balance'] += 50  # Было 100, теперь 50
+                        inviter['balance'] += 50
                         inviter['ref_progress'][awarded_key] = True
                         save_user(inviter)
                         bot.send_message(inviter['user_id'], f"🎉 Твой друг {user['full_name']} выполнил 3 задания! +50 дублей.")
@@ -1515,7 +1544,6 @@ def handle_task_moderation(call):
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         bot.answer_callback_query(call.id, "Задание принято")
     else:
-        # Запрашиваем причину отклонения
         admin_action_state['reject_task'] = {
             'pending_id': pending_id,
             'user_id': user_id,
@@ -1542,39 +1570,24 @@ def handle_prize_moderation(call):
         logger.error(f"Ошибка парсинга request_id в handle_prize_moderation: {data} ({e})")
         bot.answer_callback_query(call.id, "Ошибка данных. Сообщи админу!")
         return
-    
-    # Получаем информацию о заявке по id
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT * FROM prize_requests WHERE id=? AND status="pending"', (request_id,))
-        request = c.fetchone()
-    
-    if not request:
+    # Получаем информацию о заявке по id через Supabase
+    res = supabase.table("prize_requests").select("*").eq("id", request_id).eq("status", "pending").execute()
+    if not res.data:
         bot.answer_callback_query(call.id, "Заявка уже обработана")
         return
-    
-    user_id = request[1]  # user_id
-    prize_name = request[2]  # prize_name
-    prize_cost = request[3]  # prize_cost
-    
+    request = res.data[0]
+    user_id = request['user_id']
+    prize_name = request['prize_name']
+    prize_cost = request['prize_cost']
     if action == 'approve_prize':
-        # Одобряем заявку
         set_prize_request_status(request_id, 'approved')
-        
-        # Убираем кнопки с сообщения в группе
         try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except Exception as e:
             logger.error(f"Ошибка удаления кнопок: {e}")
-        
-        # Отправляем уведомление пользователю
         bot.send_message(user_id, f"🎉 <b>Заявка на приз одобрена!</b>\n\nПриз: <b>{prize_name}</b>\n\nСкоро с вами свяжутся для получения приза.", parse_mode='HTML')
-        
         bot.answer_callback_query(call.id, "Заявка одобрена")
-        
     else:
-        # Отклоняем заявку
-        # Запрашиваем причину отклонения
         admin_action_state['reject_prize'] = {
             'request_id': request_id,
             'user_id': user_id,
@@ -1680,15 +1693,29 @@ def show_tasks_admin_panel(message_or_call):
     tasks = get_fresh_tasks()
     markup = telebot.types.InlineKeyboardMarkup()
     for t in tasks:
-        markup.add(
-            telebot.types.InlineKeyboardButton(f"{t['name']} ({'ежедневное' if t['category']=='daily' else 'еженедельное'})", callback_data=f"edit_task_{t['id']}"),
-            telebot.types.InlineKeyboardButton("❌", callback_data=f"delete_task_{t['id']}")
-        )
+        try:
+            name = str(t.get('name') or '')
+            category = str(t.get('category') or '')
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    f"{name} ({'ежедневное' if category=='daily' else 'еженедельное'})",
+                    callback_data=f"edit_task_{t['id']}"
+                ),
+                telebot.types.InlineKeyboardButton("❌", callback_data=f"delete_task_{t['id']}")
+            )
+        except Exception as e:
+            print(f"Ошибка в задании {t}: {e}")
     markup.add(telebot.types.InlineKeyboardButton("➕ Добавить новое задание", callback_data="add_task"))
+    thread_id = getattr(getattr(message_or_call, 'message', message_or_call), 'message_thread_id', None)
+    chat_id = getattr(getattr(message_or_call, 'message', message_or_call), 'chat', None)
     if hasattr(message_or_call, 'message'):
+        # Убираем message_thread_id из edit_message_text
         bot.edit_message_text("<b>Управление заданиями</b>", message_or_call.message.chat.id, message_or_call.message.message_id, reply_markup=markup, parse_mode='HTML')
     else:
-        bot.send_message(message_or_call.from_user.id, "<b>Управление заданиями</b>", reply_markup=markup, parse_mode='HTML')
+        if thread_id:
+            bot.send_message(chat_id.id, "<b>Управление заданиями</b>", reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+        else:
+            bot.send_message(message_or_call.from_user.id, "<b>Управление заданиями</b>", reply_markup=markup, parse_mode='HTML')
 
 @bot.callback_query_handler(func=lambda call: re.match(r'^edit_task_\\d+$', call.data))
 def edit_task_start(call):
@@ -1714,7 +1741,14 @@ def edit_task_start(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == 'tasks_admin_panel')
 def back_to_tasks_admin_panel(call):
-    show_tasks_admin_panel(call)
+    # Если это личка и админ — показываем админ-панель
+    if call.message.chat.type == 'private' and call.from_user.id == admin_id:
+        show_tasks_admin_panel(call)
+    # Если это группа и нужная тема — показываем публичную панель
+    elif call.message.chat.id == GROUP_ID and getattr(call.message, 'message_thread_id', None) == TASKS_PANEL_THREAD_ID:
+        show_tasks_filter_panel(call.message)
+    else:
+        bot.answer_callback_query(call.id, 'Нет доступа или не та локация.')
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('edit_task_name_'))
 def edit_task_name(call):
@@ -1849,13 +1883,6 @@ def save_new_task_with_desc(message):
     tasks = get_fresh_tasks()
     bot.send_message(admin_id, "Задание добавлено! Список заданий обновлён.")
     show_tasks_admin_panel(message)
-
-def add_user_task(user_id, task_id):
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('INSERT INTO user_tasks (user_id, task_id, completed_at) VALUES (?, ?, ?)',
-                  (user_id, task_id, datetime.now().isoformat()))
-        conn.commit()
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('edit_task_desc_'))
 def edit_task_desc(call):
@@ -2001,34 +2028,18 @@ def admin_delete_user_step(message):
 def admin_confirm_delete(call):
     if call.from_user.id != admin_id:
         return
-    uid = int(call.data.split('_')[-1])
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('DELETE FROM pending_tasks WHERE user_id=?', (uid,))
-        c.execute('DELETE FROM users WHERE user_id=?', (uid,))
-        conn.commit()
+    try:
+        uid = int(call.data.split('_')[-1])
+    except Exception as e:
+        logger.error(f"Ошибка парсинга uid в admin_confirm_delete: {call.data} ({e})")
+        bot.answer_callback_query(call.id, "Ошибка данных. Сообщи админу!")
+        return
+    supabase.table("pending_tasks").delete().eq("user_id", uid).execute()
+    supabase.table("users").delete().eq("user_id", uid).execute()
     bot.send_message(admin_id, f"Пользователь {uid} удалён.")
     show_admin_panel(call)
 
-# --- Добавляю daily_streak в БД, если нет ---
-def ensure_daily_streak_column():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN daily_streak INTEGER DEFAULT 0')
-        except Exception:
-            pass
-ensure_daily_streak_column()
 
-# --- Добавляю weekly_earned в БД, если нет ---
-def ensure_weekly_earned_column():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN weekly_earned INTEGER DEFAULT 0')
-        except Exception:
-            pass
-ensure_weekly_earned_column()
 
 # --- Механика ежедневного входа ---
 @bot.message_handler(func=lambda m: m.text == "🔥 Ежедневный вход")
@@ -2163,23 +2174,10 @@ def handle_support_reply(message):
                 logger.error(f"Ошибка отправки ответа по призу: {e}")
                 bot.reply_to(message, "❌ Ошибка отправки ответа")
 
-# --- Сброс weekly_earned (только для админа) ---
-@bot.message_handler(commands=['reset_weekly'])
-def reset_weekly(message):
-    if message.from_user.id != admin_id:
-        return
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('UPDATE users SET weekly_earned=0')
-        conn.commit()
-    bot.send_message(admin_id, "Рейтинг недели сброшен!")
-
 # --- Ежедневное напоминание о бонусе ---
 def send_daily_reminder():
-    with sqlite3.connect('users.db') as conn:
-        c = conn.cursor()
-        c.execute('SELECT user_id FROM users')
-        user_ids = [row[0] for row in c.fetchall()]
+    res = supabase.table('users').select('user_id').execute()
+    user_ids = [row['user_id'] for row in res.data]
     for user_id in user_ids:
         try:
             user = get_user(user_id)
@@ -2191,12 +2189,12 @@ def send_daily_reminder():
             except Exception:
                 last = None
             if last == today:
-                text = f"\uD83D\uDD25 Ты уже получил дубли за сегодня! Прогресс: {streak}/7."
+                text = f"🔥 Ты уже получил дубли за сегодня! Прогресс: {streak}/7."
                 markup = None
             else:
-                text = f"\uD83D\uDD25 Не забудь получить дубли за ежедневный вход!\n\nПрогресс: {streak}/7."
+                text = f"🔥 Не забудь получить дубли за ежедневный вход!\n\nПрогресс: {streak}/7."
                 markup = telebot.types.InlineKeyboardMarkup()
-                markup.add(telebot.types.KeyboardButton("Получить дубли", callback_data="get_daily_bonus"))
+                markup.add(telebot.types.InlineKeyboardButton("Получить дубли", callback_data="get_daily_bonus"))
             bot.send_message(user_id, text, reply_markup=markup)
         except Exception as e:
             logger.error(f"Ошибка рассылки ежедневки {user_id}: {e}")
@@ -2279,6 +2277,719 @@ def start_gsheets_exporter():
 # Запуск экспортера при старте
 start_gsheets_exporter()
 
+@bot.message_handler(commands=['tasks'])
+def cmd_tasks(message):
+    show_tasks_filter_panel(message)
+
+def show_tasks_filter_panel(message, notice=None):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("🕓 Ежедневные", callback_data="filter_daily"),
+        telebot.types.InlineKeyboardButton("🗓 Еженедельные", callback_data="filter_weekly")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("📅 По дате", callback_data="filter_by_date"),
+        telebot.types.InlineKeyboardButton("🔍 Поиск", callback_data="filter_search")
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("➕ Добавить задание", callback_data="public_add_task")
+    )
+    text = "<b>📝 Управление заданиями</b>\n\nВыберите фильтр или добавьте новое задание."
+    if notice:
+        text = f"<b>{notice}</b>\n\n" + text
+    bot.send_message(
+        message.chat.id, text, reply_markup=markup, message_thread_id=getattr(message, 'message_thread_id', None), parse_mode='HTML'
+    )
+
+# --- Фильтрация и пагинация ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_'))
+def filter_tasks_handler(call):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    filter_type = call.data.replace('filter_', '')
+    if filter_type == 'daily':
+        filtered = [t for t in tasks if t.get('category') == 'daily']
+        show_tasks_page(call, filtered, 0, 'daily')
+    elif filter_type == 'weekly':
+        filtered = [t for t in tasks if t.get('category') == 'weekly']
+        show_tasks_page(call, filtered, 0, 'weekly')
+    elif filter_type == 'by_date':
+        # Список уникальных дат
+        dates = sorted(set(t.get('date') for t in tasks if t.get('date')))
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        for d in dates:
+            markup.add(telebot.types.InlineKeyboardButton(d, callback_data=f"filter_date_{d}"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="public_back_to_filter"))
+        bot.edit_message_text(
+            "<b>Выберите дату:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML', message_thread_id=call.message.message_thread_id
+        )
+    elif filter_type == 'search':
+        msg = bot.send_message(call.message.chat.id, "Введите часть названия для поиска:", message_thread_id=call.message.message_thread_id)
+        bot.register_next_step_handler_by_chat_id(call.message.chat.id, search_tasks_by_name, call.message.chat.id, call.message.message_thread_id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_date_'))
+def filter_by_date_handler(call):
+    date = call.data.replace('filter_date_', '')
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    filtered = [t for t in tasks if t.get('date') == date]
+    show_tasks_page(call, filtered, 0, f'date_{date}')
+
+# --- Пагинация ---
+TASKS_PER_PAGE = 5
+
+def show_tasks_page(call, tasks, page, filter_key):
+    total = len(tasks)
+    start = page * TASKS_PER_PAGE
+    end = start + TASKS_PER_PAGE
+    page_tasks = tasks[start:end]
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for t in page_tasks:
+        btn_text = f"{t['name']} | {('🗓 ' + t.get('date', '-')) if t.get('date') else ''} | {('🕓 Ежедневное' if t['category']=='daily' else '🗓 Еженедельное') if t.get('category') else ''}"
+        markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data=f"public_task_{t['id']}"))
+    nav = []
+    if start > 0:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{filter_key}_{page-1}"))
+    if end < total:
+        nav.append(telebot.types.InlineKeyboardButton("Вперёд ➡️", callback_data=f"page_{filter_key}_{page+1}"))
+    if nav:
+        markup.add(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ К фильтрам", callback_data="public_back_to_filter"))
+    text = f"<b>Задания ({start+1}-{min(end,total)} из {total})</b>"
+    bot.edit_message_text(
+        text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode='HTML', message_thread_id=call.message.message_thread_id
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
+def paginate_tasks_handler(call):
+    parts = call.data.split('_')
+    filter_key = '_'.join(parts[1:-1])
+    page = int(parts[-1])
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    if filter_key == 'daily':
+        filtered = [t for t in tasks if t.get('category') == 'daily']
+    elif filter_key == 'weekly':
+        filtered = [t for t in tasks if t.get('category') == 'weekly']
+    elif filter_key.startswith('date'):
+        date = filter_key.split('_', 1)[1]
+        filtered = [t for t in tasks if t.get('date') == date]
+    else:
+        filtered = tasks
+    show_tasks_page(call, filtered, page, filter_key)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'public_back_to_filter')
+def back_to_filter_panel(call):
+    bot.edit_message_text(
+        "<b>📝 Управление заданиями</b>\n\nВыберите фильтр или добавьте новое задание.",
+        call.message.chat.id, call.message.message_id,
+        reply_markup=telebot.types.InlineKeyboardMarkup().add(
+            telebot.types.InlineKeyboardButton("🕓 Ежедневные", callback_data="filter_daily"),
+            telebot.types.InlineKeyboardButton("🗓 Еженедельные", callback_data="filter_weekly"),
+            telebot.types.InlineKeyboardButton("📅 По дате", callback_data="filter_by_date"),
+            telebot.types.InlineKeyboardButton("🔍 Поиск", callback_data="filter_search"),
+            telebot.types.InlineKeyboardButton("➕ Добавить задание", callback_data="public_add_task")
+        ),
+        parse_mode='HTML',
+        message_thread_id=call.message.message_thread_id
+    )
+
+# --- Поиск по названию ---
+def search_tasks_by_name(message, chat_id, thread_id, msg_id):
+    query = message.text.strip().lower()
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    filtered = [t for t in tasks if query in t['name'].lower()]
+    if not filtered:
+        bot.send_message(chat_id, "Ничего не найдено.", message_thread_id=thread_id)
+        return
+    # Показываем первую страницу поиска
+    fake_call = type('FakeCall', (), {
+        'message': type('FakeMsg', (), {'chat': type('FakeChat', (), {'id': chat_id})(), 'message_id': msg_id, 'message_thread_id': thread_id})(),
+        'data': ''
+    })()
+    show_tasks_page(fake_call, filtered, 0, f'search_{query}')
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('public_task_'))
+def public_task_menu(call):
+    task_id = int(call.data.split('_')[-1])
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    task = next((t for t in tasks if t['id'] == task_id), None)
+    if not task:
+        bot.answer_callback_query(call.id, "Задание не найдено")
+        return
+    status = "🟢 Открыто" if task.get('date', '') <= datetime.now().strftime('%Y-%m-%d') else f"🔴 Откроется {task.get('date', '-')}"
+    text = (
+        f"<b>Задание:</b> {task['name']}\n"
+        f"<b>Описание:</b> {task['desc']}\n"
+        f"<b>Категория:</b> {'🕓 Ежедневное' if task['category']=='daily' else '🗓 Еженедельное'}\n"
+        f"<b>Награда:</b> {task['reward']}\n"
+        f"<b>Дата открытия:</b> {task.get('date', '-')}\n"
+        f"<b>Статус:</b> {status}"
+    )
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton("✏️ Название", callback_data=f"edit_task_name_{task_id}"),
+        telebot.types.InlineKeyboardButton("📝 Описание", callback_data=f"edit_task_desc_{task_id}"),
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("💰 Награда", callback_data=f"edit_task_reward_{task_id}"),
+        telebot.types.InlineKeyboardButton("🗓 Дата", callback_data=f"edit_task_date_{task_id}"),
+    )
+    markup.add(
+        telebot.types.InlineKeyboardButton("🔄 Категория", callback_data=f"edit_task_cat_{task_id}"),
+        telebot.types.InlineKeyboardButton("❌ Удалить", callback_data=f"public_delete_task_{task_id}"),
+    )
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="public_back_to_list"))
+    bot.edit_message_text(
+        text, call.message.chat.id, call.message.message_id, reply_markup=markup, message_thread_id=call.message.message_thread_id, parse_mode='HTML'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'public_back_to_list')
+def public_back_to_list(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    show_tasks_public_panel(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'public_add_task')
+def public_add_task_start(call):
+    msg = bot.send_message(call.message.chat.id, "Введите <b>название</b> задания:", parse_mode='HTML', message_thread_id=call.message.message_thread_id)
+    bot.register_next_step_handler_by_chat_id(call.message.chat.id, public_add_task_name, call.message.chat.id, call.message.message_thread_id)
+
+def public_add_task_name(message, chat_id, thread_id):
+    task = {'name': message.text.strip()}
+    msg = bot.send_message(chat_id, "Введите <b>описание</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, public_add_task_desc, chat_id, thread_id, task)
+
+def public_add_task_desc(message, chat_id, thread_id, task):
+    task['desc'] = message.text.strip()
+    msg = bot.send_message(chat_id, "Введите <b>награду</b> за выполнение (число):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, public_add_task_reward, chat_id, thread_id, task)
+
+def public_add_task_reward(message, chat_id, thread_id, task):
+    try:
+        task['reward'] = int(message.text.strip())
+    except Exception:
+        bot.send_message(chat_id, "Некорректная награда. Введите число:", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, public_add_task_reward, chat_id, thread_id, task)
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton("🕓 Ежедневное", callback_data="public_add_task_cat_daily"),
+        telebot.types.InlineKeyboardButton("🗓 Еженедельное", callback_data="public_add_task_cat_weekly")
+    )
+    bot.send_message(chat_id, "Выберите <b>категорию</b> задания:", reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+    # Сохраняем task в user_data по chat_id
+    if not hasattr(bot, 'user_data'): bot.user_data = {}
+    bot.user_data[chat_id] = {'add_task': task, 'thread_id': thread_id}
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('public_add_task_cat_'))
+def public_add_task_cat(call):
+    cat = call.data.split('_')[-1]
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    task = bot.user_data.get(chat_id, {}).get('add_task', {})
+    task['category'] = 'daily' if cat == 'daily' else 'weekly'
+    msg = bot.send_message(chat_id, "Введите <b>дату открытия</b> задания в формате ГГГГ-ММ-ДД (или 'сегодня'):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, public_add_task_date, chat_id, thread_id, task)
+
+def public_add_task_date(message, chat_id, thread_id, task):
+    date_str = message.text.strip().lower()
+    if date_str == 'сегодня':
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    try:
+        y, m, d = map(int, date_str.split('-'))
+        _ = calendar.timegm((y, m, d, 0, 0, 0))
+        task['date'] = f"{y:04d}-{m:02d}-{d:02d}"
+    except Exception:
+        bot.send_message(chat_id, "Некорректная дата. Введите в формате ГГГГ-ММ-ДД:", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, public_add_task_date, chat_id, thread_id, task)
+        return
+    # id и сохранение
+    task['id'] = get_next_task_id()
+    try:
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+    except Exception:
+        tasks = []
+    tasks.append(task)
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_tasks_public_panel(message, notice=f"Задание '{task['name']}' добавлено!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('public_delete_task_'))
+def public_delete_task(call):
+    task_id = int(call.data.split('_')[-1])
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    tasks = [t for t in tasks if t['id'] != task_id]
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_tasks_public_panel(call.message, notice="Задание удалено!")
+
+# Аналогично можно реализовать public_edit_task (по шагам, как добавление)
+
+def get_next_task_id():
+    try:
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+        return max([t['id'] for t in tasks]) + 1 if tasks else 1
+    except Exception:
+        return 1
+
+def post_or_replace_tasks_panel(chat_id, thread_id, notice=None):
+    # Удаляем старое сообщение-панель, если есть
+    try:
+        with open("tasks_panel_msg_id.txt") as f:
+            old_msg_id = int(f.read())
+        bot.delete_message(chat_id, old_msg_id)
+    except Exception:
+        pass
+    # Отправляем новое меню с фильтрами, пагинацией и поиском
+    class FakeMessage:
+        def __init__(self, chat_id, thread_id):
+            self.chat = type('FakeChat', (), {'id': chat_id})()
+            self.message_thread_id = thread_id
+    fake_msg = FakeMessage(chat_id, thread_id)
+    show_tasks_filter_panel(fake_msg, notice)
+    # show_tasks_filter_panel сам отправляет сообщение, но не сохраняет message_id
+    # Поэтому ниже ловим последнее сообщение и сохраняем его id
+    # (или доработай show_tasks_filter_panel, если нужно)
+    # ---
+    # Альтернативно: можно доработать show_tasks_filter_panel, чтобы возвращать message_id
+
+# Используй post_or_replace_tasks_panel вместо show_tasks_public_panel после любого изменения заданий:
+# post_or_replace_tasks_panel(chat_id, thread_id, notice="Задание добавлено!")
+
+# --- Автоматизация панели управления заданиями в теме ---
+def auto_post_tasks_panel():
+    try:
+        show_tasks_moder_panel(TASKS_PANEL_CHAT_ID, TASKS_PANEL_THREAD_ID)
+    except Exception as e:
+        print(f"Ошибка автопоста панели заданий: {e}")
+
+# Вызовем автопанель при старте бота
+import threading
+threading.Timer(2, auto_post_tasks_panel).start()
+
+# --- Флаг visible для заданий ---
+# При добавлении нового задания: task['visible'] = True
+# При скрытии: task['visible'] = False
+# При показе: task['visible'] = True
+
+# --- Публичная панель заданий (только в теме 142) ---
+def show_tasks_moder_panel(chat_id, thread_id, notice=None):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    tasks = sorted(tasks, key=lambda t: (t.get('date', ''), t['name']))
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for task in tasks:
+        if not task.get('visible', True):
+            btn_text = f"❌ {task['name']} (скрыто)"
+        else:
+            btn_text = f"{task['name']}"
+        markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data=f"mod_task_{task['id']}"))
+    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить задание", callback_data="mod_add_task"))
+    text = "<b>Панель модератора: задания</b>\n\nВыберите задание для управления или добавьте новое."
+    if notice:
+        text = f"<b>{notice}</b>\n\n" + text
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+    # Можно сохранять msg.message_id для удаления старой панели
+
+# --- Карточка задания для модератора ---
+def show_task_moder_card(chat_id, thread_id, task_id):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    task = next((t for t in tasks if t['id'] == task_id), None)
+    if not task:
+        show_tasks_moder_panel(chat_id, thread_id, notice="Задание не найдено!")
+        return
+    text = f"<b>Задание:</b> {task['name']}\n<b>Описание:</b> {task['desc']}\n<b>Категория:</b> {'🕓 Ежедневное' if task['category']=='daily' else '🗓 Еженедельное'}\n<b>Награда:</b> {task['reward']}\n<b>Дата:</b> {task.get('date', '-')}\n<b>Статус:</b> {'🟢 Показано' if task.get('visible', True) else '❌ Скрыто'}"
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"mod_edit_{task_id}"),
+        telebot.types.InlineKeyboardButton("❌ Удалить", callback_data=f"mod_delete_{task_id}"),
+        telebot.types.InlineKeyboardButton("👁 Скрыть" if task.get('visible', True) else "👁‍🗨 Показать", callback_data=f"mod_toggle_{task_id}")
+    )
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="mod_back"))
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+
+# --- Обработчики для модераторов (только в теме 142) ---
+@bot.callback_query_handler(func=lambda call: call.message.chat.id == GROUP_ID and getattr(call.message, 'message_thread_id', None) == TASKS_PANEL_THREAD_ID and call.from_user.id in MODERATOR_IDS and call.data.startswith('mod_'))
+def moder_tasks_callback(call):
+    data = call.data
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    if data == 'mod_add_task':
+        msg = bot.send_message(chat_id, "Введите <b>название</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_name, chat_id, thread_id, {})
+        return
+    if data == 'mod_back':
+        show_tasks_moder_panel(chat_id, thread_id)
+        return
+    if data.startswith('mod_task_'):
+        task_id = int(data.split('_')[-1])
+        show_task_moder_card(chat_id, thread_id, task_id)
+        return
+    if data.startswith('mod_delete_'):
+        task_id = int(data.split('_')[-1])
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"mod_confirmdel_{task_id}"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"mod_task_{task_id}"))
+        bot.send_message(chat_id, "Точно удалить задание?", reply_markup=markup, message_thread_id=thread_id)
+        return
+    if data.startswith('mod_confirmdel_'):
+        task_id = int(data.split('_')[-1])
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+        tasks = [t for t in tasks if t['id'] != task_id]
+        with open('tasks.json', 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        show_tasks_moder_panel(chat_id, thread_id, notice="Задание удалено!")
+        return
+    if data.startswith('mod_toggle_'):
+        task_id = int(data.split('_')[-1])
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+        for t in tasks:
+            if t['id'] == task_id:
+                t['visible'] = not t.get('visible', True)
+        with open('tasks.json', 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        show_task_moder_card(chat_id, thread_id, task_id)
+        return
+    if data.startswith('mod_edit_'):
+        task_id = int(data.split('_')[-1])
+        show_task_moder_edit(chat_id, thread_id, task_id)
+        return
+
+# --- Добавление задания (пошагово) ---
+def moder_add_task_name(message, chat_id, thread_id, task):
+    task['name'] = message.text.strip()
+    msg = bot.send_message(chat_id, "Введите <b>описание</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_desc, chat_id, thread_id, task)
+
+def moder_add_task_desc(message, chat_id, thread_id, task):
+    task['desc'] = message.text.strip()
+    msg = bot.send_message(chat_id, "Введите <b>награду</b> за выполнение (число):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_reward, chat_id, thread_id, task)
+
+def moder_add_task_reward(message, chat_id, thread_id, task):
+    try:
+        task['reward'] = int(message.text.strip())
+    except Exception:
+        bot.send_message(chat_id, "Некорректная награда. Введите число:", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_reward, chat_id, thread_id, task)
+        return
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton("🕓 Ежедневное", callback_data="mod_cat_daily"),
+        telebot.types.InlineKeyboardButton("🗓 Еженедельное", callback_data="mod_cat_weekly")
+    )
+    bot.send_message(chat_id, "Выберите <b>категорию</b> задания:", reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+    bot.user_data[chat_id] = {'add_task': task, 'thread_id': thread_id}
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_cat_'))
+def moder_add_task_cat(call):
+    cat = call.data.split('_')[-1]
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    task = bot.user_data.get(chat_id, {}).get('add_task', {})
+    task['category'] = 'daily' if cat == 'daily' else 'weekly'
+    msg = bot.send_message(chat_id, "Введите <b>дату открытия</b> задания в формате ГГГГ-ММ-ДД (или 'сегодня'):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_date, chat_id, thread_id, task)
+
+def moder_add_task_date(message, chat_id, thread_id, task):
+    date_str = message.text.strip().lower().replace(' ', '')
+    if date_str in ('сегодня', 'today', 'now', 'тудэй'):
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    try:
+        y, m, d = map(int, date_str.split('-'))
+        _ = calendar.timegm((y, m, d, 0, 0, 0))
+        task['date'] = f"{y:04d}-{m:02d}-{d:02d}"
+    except Exception as e:
+        bot.send_message(chat_id, "Некорректная дата. Введите в формате ГГГГ-ММ-ДД или 'сегодня':", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_date, chat_id, thread_id, task)
+        return
+    task['visible'] = True
+    task['id'] = get_next_task_id()
+    try:
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+    except Exception:
+        tasks = []
+    tasks.append(task)
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_tasks_moder_panel(chat_id, thread_id, notice=f"Задание '{task['name']}' добавлено!")
+
+# --- Редактирование задания (по полям, с возвратом на страницу) ---
+def show_task_moder_edit(chat_id, thread_id, task_id, page=0):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    task = next((t for t in tasks if t['id'] == task_id), None)
+    if not task:
+        show_tasks_moder_panel(chat_id, thread_id, notice="Задание не найдено!", page=page)
+        return
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("✏️ Название", callback_data=f"mod_edit_name_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("📝 Описание", callback_data=f"mod_edit_desc_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("💰 Награда", callback_data=f"mod_edit_reward_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("🗓 Дата", callback_data=f"mod_edit_date_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("🔄 Категория", callback_data=f"mod_edit_cat_{task_id}_p{page}")
+    )
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"mod_task_{task_id}_p{page}"))
+    text = f"<b>Редактирование задания:</b> {task['name']}"
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+
+# --- Реальное редактирование каждого поля (по шагам) ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_edit_name_'))
+def moder_edit_name(call):
+    parts = call.data.split('_')
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    msg = bot.send_message(chat_id, "Введите новое <b>название</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_name, chat_id, thread_id, task_id, page)
+
+def moder_save_edit_name(message, chat_id, thread_id, task_id, page):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    for t in tasks:
+        if t['id'] == task_id:
+            t['name'] = message.text.strip()
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_task_moder_card(chat_id, thread_id, task_id, page=page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_edit_desc_'))
+def moder_edit_desc(call):
+    parts = call.data.split('_')
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    msg = bot.send_message(chat_id, "Введите новое <b>описание</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_desc, chat_id, thread_id, task_id, page)
+
+def moder_save_edit_desc(message, chat_id, thread_id, task_id, page):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    for t in tasks:
+        if t['id'] == task_id:
+            t['desc'] = message.text.strip()
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_task_moder_card(chat_id, thread_id, task_id, page=page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_edit_reward_'))
+def moder_edit_reward(call):
+    parts = call.data.split('_')
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    msg = bot.send_message(chat_id, "Введите новую <b>награду</b> (число):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_reward, chat_id, thread_id, task_id, page)
+
+def moder_save_edit_reward(message, chat_id, thread_id, task_id, page):
+    try:
+        reward = int(message.text.strip())
+    except Exception:
+        bot.send_message(chat_id, "Некорректная награда. Введите число:", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_reward, chat_id, thread_id, task_id, page)
+        return
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    for t in tasks:
+        if t['id'] == task_id:
+            t['reward'] = reward
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_task_moder_card(chat_id, thread_id, task_id, page=page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_edit_date_'))
+def moder_edit_date(call):
+    parts = call.data.split('_')
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    msg = bot.send_message(chat_id, "Введите новую <b>дату</b> (ГГГГ-ММ-ДД или 'сегодня'):", parse_mode='HTML', message_thread_id=thread_id)
+    bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_date, chat_id, thread_id, task_id, page)
+
+def moder_save_edit_date(message, chat_id, thread_id, task_id, page):
+    date_str = message.text.strip().lower().replace(' ', '')
+    if date_str in ('сегодня', 'today', 'now', 'тудэй'):
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    try:
+        y, m, d = map(int, date_str.split('-'))
+        _ = calendar.timegm((y, m, d, 0, 0, 0))
+        date_val = f"{y:04d}-{m:02d}-{d:02d}"
+    except Exception as e:
+        bot.send_message(chat_id, "Некорректная дата. Введите в формате ГГГГ-ММ-ДД или 'сегодня':", message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_save_edit_date, chat_id, thread_id, task_id, page)
+        return
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    for t in tasks:
+        if t['id'] == task_id:
+            t['date'] = date_val
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_task_moder_card(chat_id, thread_id, task_id, page=page)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_edit_cat_'))
+def moder_edit_cat(call):
+    parts = call.data.split('_')
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(
+        telebot.types.InlineKeyboardButton("🕓 Ежедневное", callback_data=f"mod_setcat_daily_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("🗓 Еженедельное", callback_data=f"mod_setcat_weekly_{task_id}_p{page}")
+    )
+    bot.send_message(chat_id, "Выберите новую <b>категорию</b>:", reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mod_setcat_'))
+def moder_set_cat(call):
+    parts = call.data.split('_')
+    cat = parts[2]
+    task_id = int(parts[3])
+    page = int(parts[4][1:]) if len(parts) > 4 and parts[4].startswith('p') else 0
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    for t in tasks:
+        if t['id'] == task_id:
+            t['category'] = 'daily' if cat == 'daily' else 'weekly'
+    with open('tasks.json', 'w', encoding='utf-8') as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    show_task_moder_card(chat_id, thread_id, task_id, page=page)
+
+# --- Пагинация для панели модератора ---
+TASKS_PER_PAGE = 5
+
+def show_tasks_moder_panel(chat_id, thread_id, notice=None, page=0):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    tasks = sorted(tasks, key=lambda t: (t.get('date', ''), t['name']))
+    total = len(tasks)
+    start = page * TASKS_PER_PAGE
+    end = start + TASKS_PER_PAGE
+    page_tasks = tasks[start:end]
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for task in page_tasks:
+        btn_text = f"❌ {task['name']} (скрыто)" if not task.get('visible', True) else f"{task['name']}"
+        markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data=f"mod_task_{task['id']}_p{page}"))
+    nav = []
+    if start > 0:
+        nav.append(telebot.types.InlineKeyboardButton("⬅️", callback_data=f"mod_page_{page-1}"))
+    if end < total:
+        nav.append(telebot.types.InlineKeyboardButton("➡️", callback_data=f"mod_page_{page+1}"))
+    if nav:
+        markup.add(*nav)
+    markup.add(telebot.types.InlineKeyboardButton("➕ Добавить задание", callback_data=f"mod_add_task_p{page}"))
+    text = f"<b>Панель модератора: задания</b>\n\nПоказано {start+1}-{min(end,total)} из {total}."
+    if notice:
+        text = f"<b>{notice}</b>\n\n" + text
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+
+# --- Карточка задания с возвратом на нужную страницу ---
+def show_task_moder_card(chat_id, thread_id, task_id, page=0):
+    with open('tasks.json', 'r', encoding='utf-8') as f:
+        tasks = json.load(f)
+    task = next((t for t in tasks if t['id'] == task_id), None)
+    if not task:
+        show_tasks_moder_panel(chat_id, thread_id, notice="Задание не найдено!", page=page)
+        return
+    text = f"<b>Задание:</b> {task['name']}\n<b>Описание:</b> {task['desc']}\n<b>Категория:</b> {'🕓 Ежедневное' if task['category']=='daily' else '🗓 Еженедельное'}\n<b>Награда:</b> {task['reward']}\n<b>Дата:</b> {task.get('date', '-')}\n<b>Статус:</b> {'🟢 Показано' if task.get('visible', True) else '❌ Скрыто'}"
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("✏️ Изменить", callback_data=f"mod_edit_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("❌ Удалить", callback_data=f"mod_delete_{task_id}_p{page}"),
+        telebot.types.InlineKeyboardButton("👁 Скрыть" if task.get('visible', True) else "👁‍🗨 Показать", callback_data=f"mod_toggle_{task_id}_p{page}")
+    )
+    markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"mod_back_p{page}"))
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode='HTML', message_thread_id=thread_id)
+
+# --- Обработчик callback для модераторов с поддержкой страниц ---
+@bot.callback_query_handler(func=lambda call: call.message.chat.id == GROUP_ID and getattr(call.message, 'message_thread_id', None) == TASKS_PANEL_THREAD_ID and call.from_user.id in MODERATOR_IDS and call.data.startswith('mod_'))
+def moder_tasks_callback(call):
+    data = call.data
+    chat_id = call.message.chat.id
+    thread_id = call.message.message_thread_id
+    # Пагинация
+    if data.startswith('mod_page_'):
+        page = int(data.split('_')[-1])
+        show_tasks_moder_panel(chat_id, thread_id, page=page)
+        return
+    # Добавление
+    if data.startswith('mod_add_task'):
+        page = int(data.split('_p')[-1]) if '_p' in data else 0
+        msg = bot.send_message(chat_id, "Введите <b>название</b> задания:", parse_mode='HTML', message_thread_id=thread_id)
+        bot.register_next_step_handler_by_chat_id(chat_id, moder_add_task_name, chat_id, thread_id, {}, page)
+        return
+    # Назад
+    if data.startswith('mod_back_p'):
+        page = int(data.split('_p')[-1])
+        show_tasks_moder_panel(chat_id, thread_id, page=page)
+        return
+    # Карточка задания
+    if data.startswith('mod_task_'):
+        parts = data.split('_')
+        task_id = int(parts[2])
+        page = int(parts[3][1:]) if len(parts) > 3 and parts[3].startswith('p') else 0
+        show_task_moder_card(chat_id, thread_id, task_id, page=page)
+        return
+    # Удаление
+    if data.startswith('mod_delete_'):
+        parts = data.split('_')
+        task_id = int(parts[2])
+        page = int(parts[3][1:]) if len(parts) > 3 and parts[3].startswith('p') else 0
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("❌ Подтвердить удаление", callback_data=f"mod_confirmdel_{task_id}_p{page}"))
+        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"mod_task_{task_id}_p{page}"))
+        bot.send_message(chat_id, "Точно удалить задание?", reply_markup=markup, message_thread_id=thread_id)
+        return
+    if data.startswith('mod_confirmdel_'):
+        parts = data.split('_')
+        task_id = int(parts[2])
+        page = int(parts[3][1:]) if len(parts) > 3 and parts[3].startswith('p') else 0
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+        tasks = [t for t in tasks if t['id'] != task_id]
+        with open('tasks.json', 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        show_tasks_moder_panel(chat_id, thread_id, notice="Задание удалено!", page=page)
+        return
+    # Скрыть/Показать
+    if data.startswith('mod_toggle_'):
+        parts = data.split('_')
+        task_id = int(parts[2])
+        page = int(parts[3][1:]) if len(parts) > 3 and parts[3].startswith('p') else 0
+        with open('tasks.json', 'r', encoding='utf-8') as f:
+            tasks = json.load(f)
+        for t in tasks:
+            if t['id'] == task_id:
+                t['visible'] = not t.get('visible', True)
+        with open('tasks.json', 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        show_task_moder_card(chat_id, thread_id, task_id, page=page)
+        return
+    # Изменить
+    if data.startswith('mod_edit_'):
+        parts = data.split('_')
+        task_id = int(parts[2])
+        page = int(parts[3][1:]) if len(parts) > 3 and parts[3].startswith('p') else 0
+        show_task_moder_edit(chat_id, thread_id, task_id, page=page)
+        return
+
 
 
 
@@ -2292,9 +3003,40 @@ start_gsheets_exporter()
 if __name__ == "__main__":
     logger.info('Бот запущен!')
     print('Бот запущен!')
+    
+    # Сбрасываем webhook перед запуском
     try:
-        bot.polling(none_stop=True)
+        bot.delete_webhook()
+        print('Webhook сброшен')
     except Exception as e:
-        logger.error(f'Ошибка при запуске бота: {e}')
-        print(f'Ошибка при запуске бота: {e}')
-        print(f'Ошибка при запуске бота: {e}') 
+        print(f'Ошибка при сбросе webhook: {e}')
+    
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f'Ошибка при запуске бота: {error_msg}')
+            print(f'Ошибка при запуске бота: {error_msg}')
+            
+            # Обработка ошибки 409 (конфликт экземпляров)
+            if '409' in error_msg or 'Conflict' in error_msg:
+                print('Обнаружен конфликт экземпляров бота. Пытаемся исправить...')
+                try:
+                    # Сбрасываем webhook и получаем обновления
+                    bot.delete_webhook()
+                    updates = bot.get_updates()
+                    if updates:
+                        # Удаляем все обновления чтобы избежать повторной обработки
+                        bot.get_updates(offset=updates[-1].update_id + 1)
+                    print('Конфликт исправлен. Перезапускаем бота...')
+                    time.sleep(5)
+                    continue
+                except Exception as fix_error:
+                    print(f'Не удалось исправить конфликт: {fix_error}. Ожидаем 30 секунд...')
+                    time.sleep(30)
+                    continue
+            
+            # Для других ошибок - ждем и перезапускаем
+            print('Ожидаем 10 секунд перед перезапуском...')
+            time.sleep(10) 
